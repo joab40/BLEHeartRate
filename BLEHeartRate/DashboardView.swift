@@ -1,4 +1,4 @@
-// Tag 1.0.2
+// Version 1.0.10
 import SwiftUI
 
 struct DashboardView: View {
@@ -6,41 +6,41 @@ struct DashboardView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let configs: [SensorConfig] = ble.sensorConfigs
+            let configs: [SensorConfig] = ble.sensorConfigs                // ✅ stabil ordning (ingen sort)
             let runtimes: [UUID: SensorRuntime] = ble.runtime
             let count = configs.count
+            let isWide = geo.size.width >= 700 || geo.size.width > geo.size.height
 
-            ScrollView {
-                VStack(spacing: 12) {
-                    header
+            VStack(spacing: 12) {
+                header
 
-                    if count == 0 {
-                        ContentUnavailableView(
-                            "Inga sensorer",
-                            systemImage: "dot.radiowaves.left.and.right",
-                            description: Text("Gå till Sensorer och lägg till en pulssensor.")
-                        )
-                        .padding(.horizontal)
-                        .padding(.top, 12)
+                if count == 0 {
+                    ContentUnavailableView(
+                        "Inga sensorer",
+                        systemImage: "dot.radiowaves.left.and.right",
+                        description: Text("Gå till Sensorer och lägg till en pulssensor.")
+                    )
+                    .padding(.horizontal)
 
-                    } else if count == 1, let cfg = configs.first {
-                        // Full screen card
-                        let rt = runtimes[cfg.id] ?? SensorRuntime()
-                        FullScreenSensorCard(cfg: cfg, rt: rt, container: geo.size)
-                            .padding(.horizontal)
-                            .padding(.bottom, 24)
+                    Spacer(minLength: 0)
 
-                    } else {
-                        // Grid mode
-                        let columns = gridColumns(for: count)
-                        let cardHeight = cardMinHeight(container: geo.size, count: count)
+                } else if count <= 4 {
+                    // ✅ Fill-layout: delar upp kvarvarande höjd i jämna rutor
+                    fillLayout(configs: configs, runtimes: runtimes, isWide: isWide)
+                        .frame(maxHeight: .infinity) // tar resterande höjd under header
 
-                        LazyVGrid(columns: columns, spacing: 14) {
+                } else {
+                    // Många sensorer: scroll + grid (som vanligt)
+                    ScrollView {
+                        let cols = gridColsForMany(width: geo.size.width)
+                        LazyVGrid(
+                            columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: cols),
+                            spacing: 14
+                        ) {
                             ForEach(configs) { cfg in
                                 let rt = runtimes[cfg.id] ?? SensorRuntime()
                                 SensorCard(cfg: cfg, rt: rt, compact: true)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(minHeight: cardHeight)
+                                    .frame(minHeight: 190)
                                     .contextMenu {
                                         Button("Reconnect") { ble.connect(id: cfg.id) }
                                         Button("Disconnect") { ble.disconnect(id: cfg.id) }
@@ -55,29 +55,17 @@ struct DashboardView: View {
                         .padding(.bottom, 24)
                     }
                 }
-                .frame(minHeight: geo.size.height)
             }
+            .padding(.top, 8)
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("HR Monitor")
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { ble.reconnectAllAuto() } label: {
-                        Label("Reconnect all", systemImage: "arrow.clockwise")
-                    }
-
-                    if ble.isScanning {
-                        Button { ble.stopScan() } label: {
-                            Label("Stop", systemImage: "stop.circle")
-                        }
-                    } else {
-                        Button { ble.startScan() } label: {
-                            Label("Scan", systemImage: "magnifyingglass")
-                        }
-                    }
-                }
-            }
+            .toolbar { toolbarContent }
+            // ✅ stäng av implicit animation när runtime tickar (mindre “flicker”)
+            .transaction { tx in tx.animation = nil }
         }
     }
+
+    // MARK: Header + Toolbar
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -100,56 +88,119 @@ struct DashboardView: View {
             .padding(.horizontal)
 
             if !ble.sensorConfigs.isEmpty {
-                Text("Tryck och håll på ett kort för snabbmeny.")
+                Text("Korten fyller skärmen när få sensorer finns.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal)
             }
         }
-        .padding(.top, 8)
     }
 
-    // MARK: Grid sizing
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button { ble.reconnectAllAuto() } label: {
+                Label("Reconnect all", systemImage: "arrow.clockwise")
+            }
 
-    private func gridColumns(for count: Int) -> [GridItem] {
-        let cols: Int
-        switch count {
-        case 2: cols = 2
-        case 3, 4: cols = 2
-        case 5, 6: cols = 3
-        case 7, 8, 9: cols = 3
-        default:
-            cols = Int(ceil(sqrt(Double(count))))
+            if ble.isScanning {
+                Button { ble.stopScan() } label: {
+                    Label("Stop", systemImage: "stop.circle")
+                }
+            } else {
+                Button { ble.startScan() } label: {
+                    Label("Scan", systemImage: "magnifyingglass")
+                }
+            }
         }
-        return Array(repeating: GridItem(.flexible(), spacing: 14), count: cols)
     }
 
-    private func cardMinHeight(container: CGSize, count: Int) -> CGFloat {
-        let h = container.height
-        switch count {
+    // MARK: Fill-layout (1–4)
+
+    @ViewBuilder
+    private func fillLayout(configs: [SensorConfig],
+                            runtimes: [UUID: SensorRuntime],
+                            isWide: Bool) -> some View {
+        let spacing: CGFloat = 14
+
+        switch configs.count {
+        case 1:
+            let cfg = configs[0]
+            let rt = runtimes[cfg.id] ?? SensorRuntime()
+            SensorCard(cfg: cfg, rt: rt, compact: false)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal)
+                .padding(.bottom, 18)
+
         case 2:
-            return max(260, h * 0.52)
+            let c0 = configs[0]; let r0 = runtimes[c0.id] ?? SensorRuntime()
+            let c1 = configs[1]; let r1 = runtimes[c1.id] ?? SensorRuntime()
+
+            Group {
+                if isWide {
+                    HStack(spacing: spacing) {
+                        SensorCard(cfg: c0, rt: r0, compact: false)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        SensorCard(cfg: c1, rt: r1, compact: false)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                } else {
+                    VStack(spacing: spacing) {
+                        SensorCard(cfg: c0, rt: r0, compact: false)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        SensorCard(cfg: c1, rt: r1, compact: false)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 18)
+
         case 3, 4:
-            return max(220, h * 0.34)
-        case 5, 6:
-            return max(200, h * 0.26)
+            // 2x2 “grid” byggd med HStack/VStack för stabil höjdfördelning
+            let top = Array(configs.prefix(2))
+            let bottom = Array(configs.dropFirst(2))
+
+            VStack(spacing: spacing) {
+                HStack(spacing: spacing) {
+                    ForEach(top) { cfg in
+                        let rt = runtimes[cfg.id] ?? SensorRuntime()
+                        SensorCard(cfg: cfg, rt: rt, compact: false)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(maxHeight: .infinity)
+
+                HStack(spacing: spacing) {
+                    if bottom.isEmpty {
+                        Color.clear
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ForEach(bottom) { cfg in
+                            let rt = runtimes[cfg.id] ?? SensorRuntime()
+                            SensorCard(cfg: cfg, rt: rt, compact: false)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        if bottom.count == 1 {
+                            Color.clear
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 18)
+
         default:
-            return 190
+            EmptyView()
         }
     }
-}
 
-// MARK: - Full screen card
-
-private struct FullScreenSensorCard: View {
-    let cfg: SensorConfig
-    let rt: SensorRuntime
-    let container: CGSize
-
-    var body: some View {
-        SensorCard(cfg: cfg, rt: rt, compact: false)
-            .frame(maxWidth: .infinity)
-            .frame(minHeight: max(360, container.height * 0.72))
+    private func gridColsForMany(width: CGFloat) -> Int {
+        if width >= 900 { return 4 }
+        if width >= 700 { return 3 }
+        return 2
     }
 }
 
@@ -167,16 +218,14 @@ private struct SensorCard: View {
 
         let hrFont: Font = compact
             ? .system(size: 52, weight: .bold, design: .rounded)
-            : .system(size: 78, weight: .bold, design: .rounded)
+            : .system(size: 84, weight: .bold, design: .rounded)
 
-        let sparkHeight: CGFloat = compact ? 46 : 78
+        let sparkHeight: CGFloat = compact ? 46 : 90
 
         VStack(alignment: .leading, spacing: compact ? 12 : 16) {
-
-            // Top row
             HStack(alignment: .top) {
                 Text(cfg.avatar)
-                    .font(.system(size: compact ? 34 : 44))
+                    .font(.system(size: compact ? 34 : 46))
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(cfg.displayName)
@@ -206,10 +255,8 @@ private struct SensorCard: View {
                 }
             }
 
-            // Main numbers
             HStack(alignment: .firstTextBaseline) {
-                Text(bpmText)
-                    .font(hrFont)
+                Text(bpmText).font(hrFont)
 
                 Text("bpm")
                     .font(compact ? .headline : .title3)
@@ -226,12 +273,12 @@ private struct SensorCard: View {
                 }
             }
 
-            // Sparkline
             SparklineView(values: rt.percentHistory)
                 .frame(height: sparkHeight)
                 .opacity(rt.percentHistory.isEmpty ? 0.55 : 1.0)
 
-            // Bottom meta
+            Spacer(minLength: compact ? 0 : 8)
+
             HStack {
                 if let rr = rt.rrMs {
                     Label("\(rr) ms", systemImage: "waveform.path.ecg")
@@ -250,7 +297,6 @@ private struct SensorCard: View {
                     .foregroundStyle(.secondary)
             }
 
-            // Zone bar
             if let zone {
                 ZoneBar(zone: zone, isStale: rt.isStale)
             } else {
@@ -273,25 +319,25 @@ private struct SensorCard: View {
 
     private var statusLine: String {
         switch rt.state {
-        case ConnectionState.connected:
+        case .connected:
             return rt.isStale ? "Ansluten • Signal tappad" : "Ansluten • OK"
-        case ConnectionState.connecting:
+        case .connecting:
             return "Ansluter…"
-        case ConnectionState.scanning:
+        case .scanning:
             return "Skannar…"
-        case ConnectionState.disconnected:
+        case .disconnected:
             return "Frånkopplad"
         }
     }
 
     private var borderColor: Color {
         if rt.isStale { return .orange.opacity(0.7) }
-        if rt.state == ConnectionState.connected { return .primary.opacity(0.08) }
+        if rt.state == .connected { return .primary.opacity(0.08) }
         return .primary.opacity(0.05)
     }
 }
 
-// MARK: - ZoneBar
+// MARK: - Zone bar
 
 private struct ZoneBar: View {
     let zone: HRZone
