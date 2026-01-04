@@ -1,4 +1,4 @@
-// Version 1.0.10
+// Version 1.0.11
 import SwiftUI
 
 struct DashboardView: View {
@@ -6,38 +6,47 @@ struct DashboardView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let configs: [SensorConfig] = ble.sensorConfigs                // ✅ stabil ordning (ingen sort)
+            // ✅ Filtrera bort dolda sensorer
+            let visibleConfigs: [SensorConfig] = ble.sensorConfigs.filter { $0.showOnDashboard }
             let runtimes: [UUID: SensorRuntime] = ble.runtime
-            let count = configs.count
+            let visibleCount = visibleConfigs.count
+            let totalCount = ble.sensorConfigs.count
+
             let isWide = geo.size.width >= 700 || geo.size.width > geo.size.height
 
             VStack(spacing: 12) {
                 header
 
-                if count == 0 {
+                if totalCount > 0 && visibleCount == 0 {
+                    ContentUnavailableView(
+                        "Dashboard är tom",
+                        systemImage: "eye.slash",
+                        description: Text("Alla sensorer är dolda. Gå till Sensorer och slå på “Visa i Dashboard”.")
+                    )
+                    .padding(.horizontal)
+                    Spacer(minLength: 0)
+
+                } else if visibleCount == 0 {
                     ContentUnavailableView(
                         "Inga sensorer",
                         systemImage: "dot.radiowaves.left.and.right",
                         description: Text("Gå till Sensorer och lägg till en pulssensor.")
                     )
                     .padding(.horizontal)
-
                     Spacer(minLength: 0)
 
-                } else if count <= 4 {
-                    // ✅ Fill-layout: delar upp kvarvarande höjd i jämna rutor
-                    fillLayout(configs: configs, runtimes: runtimes, isWide: isWide)
-                        .frame(maxHeight: .infinity) // tar resterande höjd under header
+                } else if visibleCount <= 4 {
+                    fillLayout(configs: visibleConfigs, runtimes: runtimes, isWide: isWide)
+                        .frame(maxHeight: .infinity)
 
                 } else {
-                    // Många sensorer: scroll + grid (som vanligt)
                     ScrollView {
                         let cols = gridColsForMany(width: geo.size.width)
                         LazyVGrid(
                             columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: cols),
                             spacing: 14
                         ) {
-                            ForEach(configs) { cfg in
+                            ForEach(visibleConfigs) { cfg in
                                 let rt = runtimes[cfg.id] ?? SensorRuntime()
                                 SensorCard(cfg: cfg, rt: rt, compact: true)
                                     .frame(minHeight: 190)
@@ -60,7 +69,7 @@ struct DashboardView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("HR Monitor")
             .toolbar { toolbarContent }
-            // ✅ stäng av implicit animation när runtime tickar (mindre “flicker”)
+            // ✅ minimera “flicker” vid många uppdateringar
             .transaction { tx in tx.animation = nil }
         }
     }
@@ -157,7 +166,6 @@ struct DashboardView: View {
             .padding(.bottom, 18)
 
         case 3, 4:
-            // 2x2 “grid” byggd med HStack/VStack för stabil höjdfördelning
             let top = Array(configs.prefix(2))
             let bottom = Array(configs.dropFirst(2))
 

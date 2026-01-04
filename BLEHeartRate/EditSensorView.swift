@@ -1,4 +1,4 @@
-// Version 1.0.7
+// Version 1.0.11
 import SwiftUI
 
 struct EditSensorView: View {
@@ -10,8 +10,8 @@ struct EditSensorView: View {
     private let onSave: (SensorConfig) -> Void
     private let onDelete: (UUID) -> Void
 
-    // Snabbval (valfritt, bara för bekvämlighet)
-    private let quickEmojis = ["🫀","🏊‍♂️","🏊‍♀️","🐬","🦈","🔥","⚡️","⭐️","1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣"]
+    private let quickEmojis = ["🫀","🏊‍♂️","🏊‍♀️","🐬","🦈","🔥","⚡️","⭐️",
+                               "1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣"]
 
     init(config: SensorConfig,
          onSave: @escaping (SensorConfig) -> Void,
@@ -24,13 +24,12 @@ struct EditSensorView: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section("Utseende") {
+            SwiftUI.Form(content: {
+                SwiftUI.Section(header: Text("Utseende")) {
                     HStack(alignment: .center, spacing: 12) {
                         Text("Avatar")
                         Spacer()
 
-                        // Förhandsvisning
                         Text(normalizedEmoji(avatarInput))
                             .font(.system(size: 34))
                             .frame(width: 44, height: 44)
@@ -44,18 +43,14 @@ struct EditSensorView: View {
                             .keyboardType(.default)
                             .frame(width: 90)
                             .onChange(of: avatarInput) { _, newValue in
-                                // Håll fältet “rent”: om man klistrar in massa, håll bara första grapheme
                                 avatarInput = normalizedEmoji(newValue)
                             }
                     }
 
-                    // Snabbval-rad
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 10) {
                             ForEach(quickEmojis, id: \.self) { e in
-                                Button {
-                                    avatarInput = e
-                                } label: {
+                                Button { avatarInput = e } label: {
                                     Text(e).font(.system(size: 26))
                                 }
                                 .buttonStyle(.plain)
@@ -72,7 +67,15 @@ struct EditSensorView: View {
                         .textInputAutocapitalization(.words)
                 }
 
-                Section("Puls") {
+                // ✅ Kompatibel Section-syntax (header/footer som Views)
+                SwiftUI.Section(
+                    header: Text("Dashboard"),
+                    footer: Text("Om du döljer en sensor syns den inte på Dashboard, men den finns kvar under Mina sensorer.")
+                ) {
+                    Toggle("Visa i Dashboard", isOn: $cfg.showOnDashboard)
+                }
+
+                SwiftUI.Section(header: Text("Puls")) {
                     Stepper(value: $cfg.maxHR, in: 60...230, step: 1) {
                         HStack {
                             Text("Maxpuls")
@@ -85,17 +88,15 @@ struct EditSensorView: View {
                     Toggle("Auto-connect", isOn: $cfg.autoConnect)
                 }
 
-                Section {
+                SwiftUI.Section {
                     Button(role: .destructive) {
                         onDelete(cfg.id)
                         dismiss()
                     } label: {
                         Label("Ta bort sensor", systemImage: "trash")
                     }
-                } footer: {
-                    Text("Tips: Sätt namn som “Bana 1”, “Ebba” osv. Avatar kan vara valfri emoji (skriv/klistra in).")
                 }
-            }
+            })
             .navigationTitle("Redigera sensor")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -104,7 +105,6 @@ struct EditSensorView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Spara") {
-                        // Normalize inputs
                         cfg.displayName = cfg.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
                         if cfg.displayName.isEmpty { cfg.displayName = "Sensor" }
 
@@ -120,16 +120,10 @@ struct EditSensorView: View {
         }
     }
 
-    /// Returnerar “första grapheme cluster” (så en emoji med variation selectors funkar),
-    /// och begränsar längden om någon klistrar in mycket text.
+    /// Tar första grapheme cluster (så 🏊‍♂️ funkar) och ignorerar extra text/emoji.
     private func normalizedEmoji(_ s: String) -> String {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
-
-        // Ta första "Character" (Swift Character = grapheme cluster)
-        if let first = trimmed.first {
-            return String(first)
-        }
-        return ""
+        return trimmed.first.map { String($0) } ?? ""
     }
 }

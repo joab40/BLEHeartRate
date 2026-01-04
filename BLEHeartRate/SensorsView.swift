@@ -1,4 +1,4 @@
-// Version 1.0.6
+// Version 1.0.11
 import SwiftUI
 
 struct SensorsView: View {
@@ -10,6 +10,7 @@ struct SensorsView: View {
     var body: some View {
         NavigationStack {
             List {
+                // Scan-toggle
                 Section {
                     HStack {
                         Toggle(isOn: $scanEnabled) {
@@ -33,6 +34,7 @@ struct SensorsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                // Mina sensorer
                 Section("Mina sensorer") {
                     if ble.sensorConfigs.isEmpty {
                         Text("Inga sensorer ännu. Slå på Skanna och lägg till.")
@@ -52,11 +54,23 @@ struct SensorsView: View {
                                     Label("Ta bort", systemImage: "trash")
                                 }
                             }
+                            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                Button {
+                                    var updated = cfg
+                                    updated.showOnDashboard.toggle()
+                                    ble.updateConfig(updated)
+                                } label: {
+                                    Label(cfg.showOnDashboard ? "Dölj" : "Visa",
+                                          systemImage: cfg.showOnDashboard ? "eye.slash" : "eye")
+                                }
+                                .tint(cfg.showOnDashboard ? .gray : .green)
+                            }
                         }
                         .onDelete(perform: deleteRows)
                     }
                 }
 
+                // Upptäckta
                 Section("Upptäckta") {
                     if ble.discovered.isEmpty {
                         Text(ble.isScanning ? "Letar…" : "Scanning är av.")
@@ -66,23 +80,28 @@ struct SensorsView: View {
                             if let d = ble.discovered[id] {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(d.name).font(.headline)
+                                        Text(d.name)
+                                            .font(.headline)
                                         Text(id.uuidString)
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                             .lineLimit(1)
                                     }
+
                                     Spacer()
+
                                     Text("\(d.rssi) dBm")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
 
                                     Button("Lägg till") {
                                         ble.addOrUpdateConfigFromDiscovery(id: id, name: d.name)
-                                        // Efter add: öppna edit direkt så man kan sätta avatar/maxHR
+
+                                        // Öppna edit direkt så man kan sätta namn/avatar/maxHR + showOnDashboard
                                         if let added = ble.sensorConfigs.first(where: { $0.id == id }) {
                                             editingSensor = added
                                         }
+
                                         ble.connect(id: id)
                                     }
                                     .buttonStyle(.bordered)
@@ -96,7 +115,9 @@ struct SensorsView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) { EditButton() }
             }
-            .onAppear { scanEnabled = ble.isScanning }
+            .onAppear {
+                scanEnabled = ble.isScanning
+            }
             .onChange(of: ble.isScanning) { _, newValue in
                 if scanEnabled != newValue { scanEnabled = newValue }
             }
@@ -134,9 +155,17 @@ private struct SensorRow: View {
                 .font(.system(size: 28))
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(cfg.displayName)
-                    .font(.headline)
-                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    Text(cfg.displayName)
+                        .font(.headline)
+                        .lineLimit(1)
+
+                    if !cfg.showOnDashboard {
+                        Image(systemName: "eye.slash")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
 
                 Text(statusLine)
                     .font(.caption)

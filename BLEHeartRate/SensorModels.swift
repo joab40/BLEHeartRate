@@ -1,3 +1,4 @@
+// Version 1.0.11
 import Foundation
 
 enum ConnectionState: String, Codable {
@@ -14,14 +15,49 @@ struct SensorConfig: Identifiable, Codable, Equatable {
     var maxHR: Int               // 60...230
     var autoConnect: Bool
 
+    // ✅ NYTT: kan döljas från dashboard
+    var showOnDashboard: Bool = true
+
     static func `default`(id: UUID, name: String) -> SensorConfig {
         SensorConfig(
             id: id,
             displayName: name.isEmpty ? "Sensor" : name,
             avatar: "🫀",
             maxHR: 190,
-            autoConnect: true
+            autoConnect: true,
+            showOnDashboard: true
         )
+    }
+
+    // ✅ Backward compatible decoding
+    enum CodingKeys: String, CodingKey {
+        case id, displayName, avatar, maxHR, autoConnect, showOnDashboard
+    }
+
+    init(id: UUID,
+         displayName: String,
+         avatar: String,
+         maxHR: Int,
+         autoConnect: Bool,
+         showOnDashboard: Bool = true) {
+        self.id = id
+        self.displayName = displayName
+        self.avatar = avatar
+        self.maxHR = maxHR
+        self.autoConnect = autoConnect
+        self.showOnDashboard = showOnDashboard
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        avatar = try c.decode(String.self, forKey: .avatar)
+        maxHR = try c.decode(Int.self, forKey: .maxHR)
+        autoConnect = try c.decode(Bool.self, forKey: .autoConnect)
+
+        // ✅ Gamla sparade configar saknar denna → default true
+        showOnDashboard = try c.decodeIfPresent(Bool.self, forKey: .showOnDashboard) ?? true
     }
 }
 
