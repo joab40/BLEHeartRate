@@ -1,16 +1,15 @@
-// Version 1.0.5
+// Version 1.0.6
 import SwiftUI
 
 struct SensorsView: View {
     @EnvironmentObject private var ble: BLECoordinator
 
-    // Lokal UI-state som speglar ble.isScanning
     @State private var scanEnabled: Bool = false
+    @State private var editingSensor: SensorConfig? = nil
 
     var body: some View {
         NavigationStack {
             List {
-                // ✅ Tydlig scan-toggle överst
                 Section {
                     HStack {
                         Toggle(isOn: $scanEnabled) {
@@ -40,8 +39,19 @@ struct SensorsView: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(ble.sensorConfigs) { cfg in
-                            SensorRow(cfg: cfg)
-                                .environmentObject(ble)
+                            Button {
+                                editingSensor = cfg
+                            } label: {
+                                SensorRow(cfg: cfg)
+                            }
+                            .buttonStyle(.plain)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    ble.removeSensor(id: cfg.id)
+                                } label: {
+                                    Label("Ta bort", systemImage: "trash")
+                                }
+                            }
                         }
                         .onDelete(perform: deleteRows)
                     }
@@ -69,6 +79,10 @@ struct SensorsView: View {
 
                                     Button("Lägg till") {
                                         ble.addOrUpdateConfigFromDiscovery(id: id, name: d.name)
+                                        // Efter add: öppna edit direkt så man kan sätta avatar/maxHR
+                                        if let added = ble.sensorConfigs.first(where: { $0.id == id }) {
+                                            editingSensor = added
+                                        }
                                         ble.connect(id: id)
                                     }
                                     .buttonStyle(.bordered)
@@ -80,36 +94,29 @@ struct SensorsView: View {
             }
             .navigationTitle("Sensorer")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    EditButton()
-                }
+                ToolbarItem(placement: .topBarTrailing) { EditButton() }
             }
-            .onAppear {
-                // synka toggle med verkligt scanningläge
-                scanEnabled = ble.isScanning
-            }
+            .onAppear { scanEnabled = ble.isScanning }
             .onChange(of: ble.isScanning) { _, newValue in
-                // håll toggle i sync om scanning ändras av annan vy (Dashboard)
-                if scanEnabled != newValue {
-                    scanEnabled = newValue
-                }
+                if scanEnabled != newValue { scanEnabled = newValue }
             }
             .onChange(of: scanEnabled) { _, enabled in
-                // Toggle styr scanning
-                if enabled {
-                    ble.startScan()
-                } else {
-                    ble.stopScan()
+                enabled ? ble.startScan() : ble.stopScan()
+            }
+            .sheet(item: $editingSensor) { cfg in
+                EditSensorView(config: cfg) { updated in
+                    ble.updateConfig(updated)
+                } onDelete: { id in
+                    ble.removeSensor(id: id)
                 }
+                .presentationDetents([.medium, .large])
             }
         }
     }
 
     private func deleteRows(at offsets: IndexSet) {
         let ids = offsets.map { ble.sensorConfigs[$0].id }
-        for id in ids {
-            ble.removeSensor(id: id)
-        }
+        for id in ids { ble.removeSensor(id: id) }
     }
 }
 
@@ -119,7 +126,7 @@ private struct SensorRow: View {
     @EnvironmentObject private var ble: BLECoordinator
     let cfg: SensorConfig
 
-    var rt: SensorRuntime { ble.runtime[cfg.id] ?? SensorRuntime() }
+    private var rt: SensorRuntime { ble.runtime[cfg.id] ?? SensorRuntime() }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -145,27 +152,17 @@ private struct SensorRow: View {
                         .font(.subheadline.weight(.semibold))
                 }
 
-                HStack(spacing: 10) {
-                    Button { ble.connect(id: cfg.id) } label: { Image(systemName: "link") }
-                        .buttonStyle(.borderless)
-
-                    Button { ble.disconnect(id: cfg.id) } label: { Image(systemName: "link.badge.minus") }
-                        .buttonStyle(.borderless)
-
-                    Button(role: .destructive) { ble.removeSensor(id: cfg.id) } label: { Image(systemName: "trash") }
-                        .buttonStyle(.borderless)
-                }
-                .foregroundStyle(.secondary)
+                Text("Max \(cfg.maxHR)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
+
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 6)
         }
         .padding(.vertical, 6)
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            Button(role: .destructive) {
-                ble.removeSensor(id: cfg.id)
-            } label: {
-                Label("Ta bort", systemImage: "trash")
-            }
-        }
     }
 
     private var statusLine: String {
