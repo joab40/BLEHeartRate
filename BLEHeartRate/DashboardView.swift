@@ -1,3 +1,4 @@
+// Tag 1.0.2
 import SwiftUI
 
 struct DashboardView: View {
@@ -5,13 +6,9 @@ struct DashboardView: View {
 
     var body: some View {
         GeometryReader { geo in
-            // ✅ Viktigt: gör lokala kopior med explicit typ
             let configs: [SensorConfig] = ble.sensorConfigs
             let runtimes: [UUID: SensorRuntime] = ble.runtime
-
             let count = configs.count
-            let columns = gridColumns(for: count)
-            let cardHeight = cardMinHeight(container: geo.size, count: count)
 
             ScrollView {
                 VStack(spacing: 12) {
@@ -25,13 +22,23 @@ struct DashboardView: View {
                         )
                         .padding(.horizontal)
                         .padding(.top, 12)
+
+                    } else if count == 1, let cfg = configs.first {
+                        // Full screen card
+                        let rt = runtimes[cfg.id] ?? SensorRuntime()
+                        FullScreenSensorCard(cfg: cfg, rt: rt, container: geo.size)
+                            .padding(.horizontal)
+                            .padding(.bottom, 24)
+
                     } else {
+                        // Grid mode
+                        let columns = gridColumns(for: count)
+                        let cardHeight = cardMinHeight(container: geo.size, count: count)
+
                         LazyVGrid(columns: columns, spacing: 14) {
                             ForEach(configs) { cfg in
-                                // ✅ Hämtas från lokala runtimes (inte ble.runtime direkt)
                                 let rt = runtimes[cfg.id] ?? SensorRuntime()
-
-                                SensorCard(cfg: cfg, rt: rt)
+                                SensorCard(cfg: cfg, rt: rt, compact: true)
                                     .frame(maxWidth: .infinity)
                                     .frame(minHeight: cardHeight)
                                     .contextMenu {
@@ -78,7 +85,9 @@ struct DashboardView: View {
                 Label(ble.bluetoothText, systemImage: ble.isPoweredOn ? "bolt.heart" : "bolt.slash")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+
                 Spacer()
+
                 if ble.isScanning {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
@@ -105,12 +114,12 @@ struct DashboardView: View {
     private func gridColumns(for count: Int) -> [GridItem] {
         let cols: Int
         switch count {
-        case 0, 1: cols = 1
         case 2: cols = 2
         case 3, 4: cols = 2
         case 5, 6: cols = 3
         case 7, 8, 9: cols = 3
-        default: cols = Int(ceil(sqrt(Double(count))))
+        default:
+            cols = Int(ceil(sqrt(Double(count))))
         }
         return Array(repeating: GridItem(.flexible(), spacing: 14), count: cols)
     }
@@ -118,39 +127,64 @@ struct DashboardView: View {
     private func cardMinHeight(container: CGSize, count: Int) -> CGFloat {
         let h = container.height
         switch count {
-        case 0: return 0
-        case 1: return max(280, h * 0.72)
-        case 2: return max(240, h * 0.55)
-        case 3, 4: return max(220, h * 0.36)
-        case 5, 6: return max(200, h * 0.28)
-        default: return 190
+        case 2:
+            return max(260, h * 0.52)
+        case 3, 4:
+            return max(220, h * 0.34)
+        case 5, 6:
+            return max(200, h * 0.26)
+        default:
+            return 190
         }
     }
 }
 
-// MARK: - Card
+// MARK: - Full screen card
+
+private struct FullScreenSensorCard: View {
+    let cfg: SensorConfig
+    let rt: SensorRuntime
+    let container: CGSize
+
+    var body: some View {
+        SensorCard(cfg: cfg, rt: rt, compact: false)
+            .frame(maxWidth: .infinity)
+            .frame(minHeight: max(360, container.height * 0.72))
+    }
+}
+
+// MARK: - Sensor card
 
 private struct SensorCard: View {
     let cfg: SensorConfig
     let rt: SensorRuntime
+    let compact: Bool
 
     var body: some View {
         let bpmText = rt.hr.map(String.init) ?? "—"
         let pctText = rt.percentOfMax.map { "\($0)%" } ?? "—%"
         let zone = rt.percentOfMax.map { HRZone.from(percent: $0) }
 
-        VStack(alignment: .leading, spacing: 12) {
+        let hrFont: Font = compact
+            ? .system(size: 52, weight: .bold, design: .rounded)
+            : .system(size: 78, weight: .bold, design: .rounded)
 
+        let sparkHeight: CGFloat = compact ? 46 : 78
+
+        VStack(alignment: .leading, spacing: compact ? 12 : 16) {
+
+            // Top row
             HStack(alignment: .top) {
-                Text(cfg.avatar).font(.system(size: 34))
+                Text(cfg.avatar)
+                    .font(.system(size: compact ? 34 : 44))
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(cfg.displayName)
-                        .font(.headline)
+                        .font(compact ? .headline : .title2.weight(.semibold))
                         .lineLimit(1)
 
                     Text(statusLine)
-                        .font(.caption)
+                        .font(compact ? .caption : .subheadline)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -160,57 +194,63 @@ private struct SensorCard: View {
                 VStack(alignment: .trailing, spacing: 4) {
                     if let b = rt.battery {
                         Label("\(b)%", systemImage: "battery.100")
-                            .font(.caption2)
+                            .font(compact ? .caption2 : .caption)
                             .foregroundStyle(.secondary)
                             .labelStyle(.titleAndIcon)
                     }
                     if let rssi = rt.rssi {
                         Text("\(rssi) dBm")
-                            .font(.caption2)
+                            .font(compact ? .caption2 : .caption)
                             .foregroundStyle(.secondary)
                     }
                 }
             }
 
+            // Main numbers
             HStack(alignment: .firstTextBaseline) {
                 Text(bpmText)
-                    .font(.system(size: 52, weight: .bold, design: .rounded))
+                    .font(hrFont)
 
                 Text("bpm")
-                    .font(.headline)
+                    .font(compact ? .headline : .title3)
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text(pctText).font(.headline)
+                    Text(pctText)
+                        .font(compact ? .headline : .title3.weight(.semibold))
                     Text("av max \(cfg.maxHR)")
-                        .font(.caption)
+                        .font(compact ? .caption : .subheadline)
                         .foregroundStyle(.secondary)
                 }
             }
 
+            // Sparkline
             SparklineView(values: rt.percentHistory)
+                .frame(height: sparkHeight)
                 .opacity(rt.percentHistory.isEmpty ? 0.55 : 1.0)
 
+            // Bottom meta
             HStack {
                 if let rr = rt.rrMs {
                     Label("\(rr) ms", systemImage: "waveform.path.ecg")
-                        .font(.caption)
+                        .font(compact ? .caption : .subheadline)
                         .foregroundStyle(.secondary)
                 } else {
                     Label("RR —", systemImage: "waveform.path.ecg")
-                        .font(.caption)
+                        .font(compact ? .caption : .subheadline)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
 
                 Text("seen \(rt.lastSeenSeconds)s")
-                    .font(.caption)
+                    .font(compact ? .caption : .subheadline)
                     .foregroundStyle(.secondary)
             }
 
+            // Zone bar
             if let zone {
                 ZoneBar(zone: zone, isStale: rt.isStale)
             } else {
@@ -219,16 +259,16 @@ private struct SensorCard: View {
                     .frame(height: 10)
             }
         }
-        .padding(16)
+        .padding(compact ? 16 : 22)
         .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .fill(.ultraThinMaterial)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .strokeBorder(borderColor, lineWidth: 1)
         )
-        .shadow(radius: 8, y: 3)
+        .shadow(radius: 10, y: 4)
     }
 
     private var statusLine: String {

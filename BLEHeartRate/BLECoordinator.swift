@@ -1,3 +1,5 @@
+// Tag 1.0.2
+
 import Foundation
 import CoreBluetooth
 import Combine
@@ -14,10 +16,10 @@ final class BLECoordinator: NSObject, ObservableObject {
         didSet { Persistence.saveSensors(sensorConfigs) }
     }
 
-    // Runtime per sensor (UI-kort läser härifrån)
+    /// Runtime per sensor (UI läser härifrån)
     @Published private(set) var runtime: [UUID: SensorRuntime] = [:]
 
-    // Upptäckta enheter under scan (för Add-flow)
+    /// Discovered peripherals under scan (för “lägg till”)
     @Published var discovered: [UUID: (name: String, rssi: Int)] = [:]
 
     // MARK: CoreBluetooth
@@ -27,68 +29,79 @@ final class BLECoordinator: NSObject, ObservableObject {
     private var hrChar: [UUID: CBCharacteristic] = [:]
     private var batteryChar: [UUID: CBCharacteristic] = [:]
 
-    // reconnect/backoff
+    // MARK: Desired connections (minskar reconnect-tryck)
+    /// Set av sensorer vi vill ha uppkopplade (autoConnect + manuellt connect)
+    private var desiredConnections: Set<UUID> = []
+
+    // MARK: Reconnect/backoff (ultra snabb reacquire)
     private var reconnectAttempts: [UUID: Int] = [:]
     private var reconnectTasks: [UUID: Task<Void, Never>] = [:]
 
-    // anti-thrash
+    // Anti-thrash
     private var lastConnectAttemptAt: [UUID: Date] = [:]
-    private let minConnectAttemptInterval: TimeInterval = 1.0
-    private let reconnectDelayCapSeconds: Int = 5
+    private let minConnectAttemptInterval: TimeInterval = 0.8
 
-    // timers
+    // Backoff cap (sek): 0,1,2,2,2...
+    private let reconnectDelayCapSeconds: Int = 2
+
+    // Timers
     private var tickTask: Task<Void, Never>?
     private var rssiTask: Task<Void, Never>?
+    private var batteryTask: Task<Void, Never>?
 
-    // "stale" (tyst HR-data) – UI only, INGEN reconnect
+    // Stale UI-only (ingen reconnect)
     private let staleAfterSeconds: Int = 10
 
-    // percent history length (t.ex. ~3 minuter vid ~1Hz)
-    private let maxHistoryCount: Int = 180
+    // Sparkline history
+    private let maxHistoryCount: Int = 240 // ~4 min vid ~1Hz
+
+    // Scan mode: auto (för reacquire) eller manual (användaren trycker Scan)
+    private enum ScanMode { case off, auto, manual }
+    private var scanMode: ScanMode = .off
 
     override init() {
         super.init()
 
         sensorConfigs = Persistence.loadSensors()
-        // Central på main-queue (enklare & stabilt för @Published/UI)
         central = CBCentralManager(delegate: self, queue: nil)
 
-        // init runtime entries
+        // init runtime entries + desired connections för autoConnect
         for cfg in sensorConfigs {
             ensureRuntimeExists(for: cfg.id)
+            if cfg.autoConnect {
+                desiredConnections.insert(cfg.id)
+            }
         }
 
         startTicking()
         startRSSIPolling()
+        startBatteryPolling()
     }
 
     deinit {
         tickTask?.cancel()
         rssiTask?.cancel()
-        for (_, task) in reconnectTasks { task.cancel() }
+        batteryTask?.cancel()
+        for (_, t) in reconnectTasks { t.cancel() }
     }
 
     // MARK: Public actions
 
+    /// Manuell scan (dashboard-knapp / scanner-sheet)
     func startScan() {
         guard isPoweredOn else { return }
-
-        discovered.removeAll()
-        isScanning = true
-
-        central.scanForPeripherals(withServices: nil, options: [
-            CBCentralManagerScanOptionAllowDuplicatesKey: false
-        ])
+        scanMode = .manual
+        startCentralScan(aggressive: true)
     }
 
     func stopScan() {
+        scanMode = .off
         central.stopScan()
         isScanning = false
     }
 
     func addOrUpdateConfigFromDiscovery(id: UUID, name: String) {
         if let idx = sensorConfigs.firstIndex(where: { $0.id == id }) {
-            // uppdatera namn bara om det är default/okänt
             if sensorConfigs[idx].displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || sensorConfigs[idx].displayName == "Sensor" {
                 sensorConfigs[idx].displayName = name
@@ -96,24 +109,8 @@ final class BLECoordinator: NSObject, ObservableObject {
         } else {
             sensorConfigs.append(.default(id: id, name: name))
         }
+
         ensureRuntimeExists(for: id)
-    }
-
-    func removeSensor(id: UUID) {
-        sensorConfigs.removeAll { $0.id == id }
-        runtime[id] = nil
-
-        cancelReconnect(id: id)
-
-        if let p = peripherals[id] {
-            central.cancelPeripheralConnection(p)
-        }
-
-        peripherals[id] = nil
-        hrChar[id] = nil
-        batteryChar[id] = nil
-
-        ensureScanningForAutoReconnect()
     }
 
     func updateConfig(_ cfg: SensorConfig) {
@@ -124,28 +121,63 @@ final class BLECoordinator: NSObject, ObservableObject {
         }
 
         ensureRuntimeExists(for: cfg.id)
-        ensureScanningForAutoReconnect()
 
+        // Desired connections enligt autoConnect
         if cfg.autoConnect {
+            desiredConnections.insert(cfg.id)
             connect(id: cfg.id)
+        } else {
+            // Om användaren slår av autoConnect så slutar vi jaga den automatiskt
+            desiredConnections.remove(cfg.id)
         }
+
+        ensureAutoScanIfNeeded()
     }
 
+    func removeSensor(id: UUID) {
+        // sluta vilja ha den uppkopplad
+        desiredConnections.remove(id)
+        cancelReconnect(id: id)
+
+        // disconnect om den är ansluten
+        if let p = peripherals[id] {
+            central.cancelPeripheralConnection(p)
+        }
+
+        // rensa caches
+        peripherals[id] = nil
+        hrChar[id] = nil
+        batteryChar[id] = nil
+
+        // ta bort från listor
+        sensorConfigs.removeAll { $0.id == id }
+        runtime[id] = nil
+
+        ensureAutoScanIfNeeded()
+    }
+
+    /// Manuell connect (eller autoconnect kick)
     func connect(id: UUID) {
         ensureRuntimeExists(for: id)
 
-        // anti-thrash: inte oftare än 1 gång/sek per enhet
+        // Markera att vi vill ha uppkoppling
+        desiredConnections.insert(id)
+
+        // anti-thrash
         let now = Date()
         if let last = lastConnectAttemptAt[id], now.timeIntervalSince(last) < minConnectAttemptInterval {
+            ensureAutoScanIfNeeded()
             return
         }
         lastConnectAttemptAt[id] = now
 
-        // om vi redan försöker ansluta – gör inget
-        if runtime[id]?.state == .connecting { return }
-        if runtime[id]?.state == .connected { return }
+        // already connecting/connected?
+        if runtime[id]?.state == .connecting || runtime[id]?.state == .connected {
+            ensureAutoScanIfNeeded()
+            return
+        }
 
-        // försök hitta peripheral: cache -> retrieve -> scan
+        // hitta peripheral via cache / retrieve
         let p = peripherals[id] ?? retrieveKnownPeripheral(id: id)
 
         guard let peripheral = p else {
@@ -153,8 +185,8 @@ final class BLECoordinator: NSObject, ObservableObject {
                 r.state = .connecting
                 r.statusText = "Väntar på upptäckt…"
             }
-            // se till att vi scannar så vi kan hitta den direkt när den kommer upp ur vattnet
-            ensureScanningForAutoReconnect()
+            // se till att vi scannar så fort den kommer upp ur vattnet
+            ensureAutoScanIfNeeded()
             scheduleReconnect(id: id, immediate: true)
             return
         }
@@ -165,9 +197,12 @@ final class BLECoordinator: NSObject, ObservableObject {
         }
 
         central.connect(peripheral, options: nil)
+        ensureAutoScanIfNeeded()
     }
 
+    /// Manuell disconnect (stoppar “jakt”)
     func disconnect(id: UUID) {
+        desiredConnections.remove(id)
         cancelReconnect(id: id)
 
         if let p = peripherals[id] {
@@ -179,17 +214,62 @@ final class BLECoordinator: NSObject, ObservableObject {
             r.statusText = "Frånkopplad"
         }
 
-        ensureScanningForAutoReconnect()
+        ensureAutoScanIfNeeded()
     }
 
+    /// Reconnect alla som har autoConnect (och lägg dem i desired)
     func reconnectAllAuto() {
         for cfg in sensorConfigs where cfg.autoConnect {
+            desiredConnections.insert(cfg.id)
             connect(id: cfg.id)
         }
-        ensureScanningForAutoReconnect()
+        ensureAutoScanIfNeeded()
     }
 
-    // MARK: Internal helpers
+    // MARK: Scanning policy
+
+    private func startCentralScan(aggressive: Bool) {
+        guard isPoweredOn else { return }
+        discovered.removeAll()
+
+        // Aggressiv scan: allow duplicates för snabbare reacquire/uppdatering
+        central.scanForPeripherals(withServices: nil, options: [
+            CBCentralManagerScanOptionAllowDuplicatesKey: aggressive
+        ])
+
+        isScanning = true
+    }
+
+    /// Auto-scan endast när någon desired sensor inte är connected
+    private func ensureAutoScanIfNeeded() {
+        guard isPoweredOn else { return }
+
+        // manual scan har prioritet
+        if scanMode == .manual {
+            return
+        }
+
+        // Behöver vi scanna?
+        let needsScan = desiredConnections.contains { id in
+            let st = runtime[id]?.state ?? .disconnected
+            return st != .connected
+        }
+
+        if needsScan {
+            if scanMode != .auto || !isScanning {
+                scanMode = .auto
+                startCentralScan(aggressive: true)
+            }
+        } else {
+            if scanMode == .auto && isScanning {
+                central.stopScan()
+                isScanning = false
+            }
+            scanMode = .off
+        }
+    }
+
+    // MARK: Runtime helpers
 
     private func ensureRuntimeExists(for id: UUID) {
         if runtime[id] == nil {
@@ -201,7 +281,7 @@ final class BLECoordinator: NSObject, ObservableObject {
         var r = runtime[id] ?? SensorRuntime()
         mutate(&r)
 
-        // compute percent-of-max
+        // percent-of-max
         if let bpm = r.hr, let cfg = sensorConfigs.first(where: { $0.id == id }) {
             let pct = Int((Double(bpm) / Double(max(cfg.maxHR, 1))) * 100.0)
             r.percentOfMax = max(0, min(200, pct))
@@ -214,11 +294,11 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     private func retrieveKnownPeripheral(id: UUID) -> CBPeripheral? {
         let found = central.retrievePeripherals(withIdentifiers: [id]).first
-        if let found {
-            peripherals[id] = found
-        }
+        if let found { peripherals[id] = found }
         return found
     }
+
+    // MARK: Reconnect scheduling
 
     private func cancelReconnect(id: UUID) {
         reconnectTasks[id]?.cancel()
@@ -226,61 +306,48 @@ final class BLECoordinator: NSObject, ObservableObject {
         reconnectAttempts[id] = 0
     }
 
-    private func scheduleReconnect(id: UUID, immediate: Bool = false) {
-        guard let cfg = sensorConfigs.first(where: { $0.id == id }), cfg.autoConnect else { return }
+    private func scheduleReconnect(id: UUID, immediate: Bool) {
+        // reconnect endast om vi faktiskt vill ha den ansluten
+        guard desiredConnections.contains(id) else { return }
 
         reconnectTasks[id]?.cancel()
 
         let attempt = (reconnectAttempts[id] ?? 0) + 1
         reconnectAttempts[id] = attempt
 
-        // Backoff: 0,1,2,4,5,5... (cap 5s)
-        let seconds: Int
+        let delaySeconds: Int
         if immediate {
-            seconds = 0
+            delaySeconds = 0
         } else {
-            seconds = min(Int(pow(2.0, Double(attempt - 1))), reconnectDelayCapSeconds)
+            // 1,2,2,2...
+            delaySeconds = min(Int(pow(2.0, Double(attempt - 1))), reconnectDelayCapSeconds)
         }
 
         reconnectTasks[id] = Task { [weak self] in
             guard let self else { return }
-            if seconds > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+
+            if delaySeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
             }
             if Task.isCancelled { return }
 
-            // redan connected? stoppa
+            // Om vi inte längre vill ha anslutning, sluta
+            guard self.desiredConnections.contains(id) else { return }
+
+            // redan connected?
             if self.runtime[id]?.state == .connected { return }
 
-            // Viktigt: scanna så fort vi behöver återfå enheten
-            self.ensureScanningForAutoReconnect()
-
-            // försök anslut
+            self.ensureAutoScanIfNeeded()
             self.connect(id: id)
 
-            // om vi inte är connected än, fortsätt försöka (max delay 5s)
+            // fortsätt tills vi är tillbaka
             if self.runtime[id]?.state != .connected {
                 self.scheduleReconnect(id: id, immediate: false)
             }
         }
     }
 
-    private func ensureScanningForAutoReconnect() {
-        guard isPoweredOn else { return }
-
-        let needsScan = sensorConfigs.contains { cfg in
-            guard cfg.autoConnect else { return false }
-            let st = runtime[cfg.id]?.state ?? .disconnected
-            return st != .connected
-        }
-
-        if needsScan && !isScanning {
-            startScan()
-        } else if !needsScan && isScanning {
-            // stoppa scanning när allt är tillbaka (spar batteri)
-            stopScan()
-        }
-    }
+    // MARK: Timers
 
     private func startTicking() {
         tickTask?.cancel()
@@ -306,7 +373,7 @@ final class BLECoordinator: NSObject, ObservableObject {
                     r.lastSeenSeconds = max(0, sec)
                     r.isStale = sec >= staleAfterSeconds
 
-                    // OBS: stale är UI-only – INGEN reconnect
+                    // stale är UI-only – ingen reconnect
                     if r.state == .connected {
                         r.statusText = r.isStale ? "Signal tappad (under vatten?)" : "Tar emot data"
                     }
@@ -326,13 +393,30 @@ final class BLECoordinator: NSObject, ObservableObject {
         rssiTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                for cfg in self.sensorConfigs {
-                    let id = cfg.id
+                for id in self.desiredConnections {
                     if self.runtime[id]?.state == .connected, let p = self.peripherals[id] {
                         p.readRSSI()
                     }
                 }
-                try? await Task.sleep(nanoseconds: 3_000_000_000) // var 3s
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
+
+    private func startBatteryPolling() {
+        batteryTask?.cancel()
+        batteryTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                for id in self.desiredConnections {
+                    if self.runtime[id]?.state == .connected,
+                       let p = self.peripherals[id],
+                       let c = self.batteryChar[id] {
+                        // läsa batteri ibland (t.ex. var 60s)
+                        p.readValue(for: c)
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 60_000_000_000) // 60s
             }
         }
     }
@@ -357,16 +441,25 @@ extension BLECoordinator: CBCentralManagerDelegate {
         case .poweredOn:
             bluetoothText = "Bluetooth: På"
             isPoweredOn = true
-            // autoconnect direkt
+
+            // auto-connect: lägg autoConnect-sensorer i desired
+            for cfg in sensorConfigs where cfg.autoConnect {
+                desiredConnections.insert(cfg.id)
+            }
+
             reconnectAllAuto()
+            ensureAutoScanIfNeeded()
 
         case .poweredOff:
             bluetoothText = "Bluetooth: Av"
             isPoweredOn = false
-            isScanning = false
-            stopScan()
 
-            // markera allt som disconnected
+            if isScanning {
+                central.stopScan()
+                isScanning = false
+            }
+            scanMode = .off
+
             for cfg in sensorConfigs {
                 setRuntime(id: cfg.id) { r in
                     r.state = .disconnected
@@ -406,8 +499,8 @@ extension BLECoordinator: CBCentralManagerDelegate {
         peripherals[id] = peripheral
         discovered[id] = (name: name, rssi: RSSI.intValue)
 
-        // Om vi känner igen en autoConnect-sensor: anslut så fort den dyker upp
-        if let cfg = sensorConfigs.first(where: { $0.id == id }), cfg.autoConnect {
+        // Om vi vill ha uppkoppling till den här sensorn: anslut direkt när den syns
+        if desiredConnections.contains(id) {
             ensureRuntimeExists(for: id)
             let st = runtime[id]?.state ?? .disconnected
             if st != .connected && st != .connecting {
@@ -430,8 +523,7 @@ extension BLECoordinator: CBCentralManagerDelegate {
         peripheral.delegate = self
         peripheral.discoverServices([BLEConstants.heartRateService, BLEConstants.batteryService])
 
-        // Om alla auto-sensorer är tillbaka kan vi stoppa scanning
-        ensureScanningForAutoReconnect()
+        ensureAutoScanIfNeeded()
     }
 
     func centralManager(_ central: CBCentralManager,
@@ -444,7 +536,7 @@ extension BLECoordinator: CBCentralManagerDelegate {
             r.statusText = "Kunde inte ansluta"
         }
 
-        ensureScanningForAutoReconnect()
+        ensureAutoScanIfNeeded()
         scheduleReconnect(id: id, immediate: false)
     }
 
@@ -458,13 +550,16 @@ extension BLECoordinator: CBCentralManagerDelegate {
 
         setRuntime(id: id) { r in
             r.state = .disconnected
-            r.statusText = "Frånkopplad (återansluter…)"
-            // behåll senaste HR/percentHistory så kortet inte “dör visuellt”
+            r.statusText = desiredConnections.contains(id) ? "Frånkopplad (återansluter…)" : "Frånkopplad"
         }
 
-        // pool-case: disconnect är normalt → scanna direkt och försök återanslut snabbt
-        ensureScanningForAutoReconnect()
-        scheduleReconnect(id: id, immediate: true)
+        // Pool-case: disconnect är normalt. Reconnect bara om vi faktiskt vill ha den.
+        if desiredConnections.contains(id) {
+            ensureAutoScanIfNeeded()
+            scheduleReconnect(id: id, immediate: true)
+        } else {
+            ensureAutoScanIfNeeded()
+        }
     }
 }
 
@@ -473,13 +568,12 @@ extension BLECoordinator: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         let id = peripheral.identifier
-
         guard error == nil else {
             setRuntime(id: id) { r in r.statusText = "Service-fel" }
             return
         }
-
         guard let services = peripheral.services else { return }
+
         for s in services {
             if s.uuid == BLEConstants.heartRateService {
                 peripheral.discoverCharacteristics([BLEConstants.heartRateMeasurement], for: s)
@@ -506,7 +600,7 @@ extension BLECoordinator: CBPeripheralDelegate {
 
             if c.uuid == BLEConstants.batteryLevel {
                 batteryChar[id] = c
-                // läs en gång (och du kan läsa igen t.ex. var 5:e minut om du vill)
+                // Läs direkt vid connect
                 peripheral.readValue(for: c)
             }
         }
@@ -517,7 +611,6 @@ extension BLECoordinator: CBPeripheralDelegate {
                     error: Error?) {
         let id = peripheral.identifier
         guard error == nil else { return }
-
         if characteristic.uuid == BLEConstants.heartRateMeasurement, characteristic.isNotifying {
             setRuntime(id: id) { r in r.statusText = "Tar emot data" }
         }
@@ -538,7 +631,6 @@ extension BLECoordinator: CBPeripheralDelegate {
                     r.lastHRAt = Date()
                     r.statusText = "Tar emot data"
                 }
-                // uppdatera percentHistory (för sparkline)
                 appendPercentHistory(id: id)
             }
         } else if characteristic.uuid == BLEConstants.batteryLevel {
@@ -556,7 +648,6 @@ extension BLECoordinator: CBPeripheralDelegate {
                     error: Error?) {
         guard error == nil else { return }
         let id = peripheral.identifier
-
         setRuntime(id: id) { r in
             r.rssi = RSSI.intValue
         }
