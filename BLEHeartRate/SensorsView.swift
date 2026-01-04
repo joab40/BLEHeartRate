@@ -1,40 +1,62 @@
-// Tag 1.0.4
+// Version 1.0.5
 import SwiftUI
 
 struct SensorsView: View {
     @EnvironmentObject private var ble: BLECoordinator
 
-    @State private var showingDiscovered = false
+    // Lokal UI-state som speglar ble.isScanning
+    @State private var scanEnabled: Bool = false
 
     var body: some View {
         NavigationStack {
             List {
-                // Mina sensorer
+                // ✅ Tydlig scan-toggle överst
+                Section {
+                    HStack {
+                        Toggle(isOn: $scanEnabled) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "magnifyingglass")
+                                Text("Skanna")
+                            }
+                        }
+                        .toggleStyle(.switch)
+
+                        Spacer()
+
+                        if ble.isScanning {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+
+                    Text(ble.isScanning ? "Scanning är på — sensorer dyker upp under ‘Upptäckta’." :
+                                         "Slå på scanning för att hitta sensorer i närheten.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
                 Section("Mina sensorer") {
                     if ble.sensorConfigs.isEmpty {
-                        Text("Inga sensorer ännu. Tryck + för att lägga till.")
+                        Text("Inga sensorer ännu. Slå på Skanna och lägg till.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(ble.sensorConfigs) { cfg in
                             SensorRow(cfg: cfg)
                                 .environmentObject(ble)
                         }
-                        .onDelete(perform: deleteRows) // swipe-to-delete
+                        .onDelete(perform: deleteRows)
                     }
                 }
 
-                // Upptäckta (valfritt)
-                Section("Upptäckta (scan)") {
+                Section("Upptäckta") {
                     if ble.discovered.isEmpty {
-                        Text(ble.isScanning ? "Skannar…" : "Tryck Scan för att hitta sensorer.")
+                        Text(ble.isScanning ? "Letar…" : "Scanning är av.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(ble.discovered.keys.sorted(by: { $0.uuidString < $1.uuidString }), id: \.self) { id in
                             if let d = ble.discovered[id] {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(d.name)
-                                            .font(.headline)
+                                        Text(d.name).font(.headline)
                                         Text(id.uuidString)
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
@@ -58,22 +80,26 @@ struct SensorsView: View {
             }
             .navigationTitle("Sensorer")
             .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
+                ToolbarItem(placement: .topBarTrailing) {
                     EditButton()
-
-                    if ble.isScanning {
-                        Button {
-                            ble.stopScan()
-                        } label: {
-                            Label("Stop", systemImage: "stop.circle")
-                        }
-                    } else {
-                        Button {
-                            ble.startScan()
-                        } label: {
-                            Label("Scan", systemImage: "magnifyingglass")
-                        }
-                    }
+                }
+            }
+            .onAppear {
+                // synka toggle med verkligt scanningläge
+                scanEnabled = ble.isScanning
+            }
+            .onChange(of: ble.isScanning) { _, newValue in
+                // håll toggle i sync om scanning ändras av annan vy (Dashboard)
+                if scanEnabled != newValue {
+                    scanEnabled = newValue
+                }
+            }
+            .onChange(of: scanEnabled) { _, enabled in
+                // Toggle styr scanning
+                if enabled {
+                    ble.startScan()
+                } else {
+                    ble.stopScan()
                 }
             }
         }
@@ -119,27 +145,15 @@ private struct SensorRow: View {
                         .font(.subheadline.weight(.semibold))
                 }
 
-                HStack(spacing: 8) {
-                    Button {
-                        ble.connect(id: cfg.id)
-                    } label: {
-                        Image(systemName: "link")
-                    }
-                    .buttonStyle(.borderless)
+                HStack(spacing: 10) {
+                    Button { ble.connect(id: cfg.id) } label: { Image(systemName: "link") }
+                        .buttonStyle(.borderless)
 
-                    Button {
-                        ble.disconnect(id: cfg.id)
-                    } label: {
-                        Image(systemName: "link.badge.minus")
-                    }
-                    .buttonStyle(.borderless)
+                    Button { ble.disconnect(id: cfg.id) } label: { Image(systemName: "link.badge.minus") }
+                        .buttonStyle(.borderless)
 
-                    Button(role: .destructive) {
-                        ble.removeSensor(id: cfg.id)
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless)
+                    Button(role: .destructive) { ble.removeSensor(id: cfg.id) } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless)
                 }
                 .foregroundStyle(.secondary)
             }
@@ -150,23 +164,6 @@ private struct SensorRow: View {
                 ble.removeSensor(id: cfg.id)
             } label: {
                 Label("Ta bort", systemImage: "trash")
-            }
-        }
-        .swipeActions(edge: .leading, allowsFullSwipe: false) {
-            if rt.state != ConnectionState.connected {
-                Button {
-                    ble.connect(id: cfg.id)
-                } label: {
-                    Label("Anslut", systemImage: "link")
-                }
-                .tint(.green)
-            } else {
-                Button {
-                    ble.disconnect(id: cfg.id)
-                } label: {
-                    Label("Koppla från", systemImage: "link.badge.minus")
-                }
-                .tint(.orange)
             }
         }
     }
