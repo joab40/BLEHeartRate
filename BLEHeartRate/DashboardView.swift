@@ -1,4 +1,4 @@
-// Version 1.0.14
+// Version 1.0.16
 import SwiftUI
 
 struct DashboardView: View {
@@ -95,13 +95,6 @@ struct DashboardView: View {
                 }
             }
             .padding(.horizontal)
-
-            if !ble.sensorConfigs.isEmpty {
-                Text("Korten fyller skärmen när få sensorer finns.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal)
-            }
         }
     }
 
@@ -209,44 +202,31 @@ struct DashboardView: View {
     // MARK: Optimized cols for 5+
 
     private func optimizedGridCols(width: CGFloat, count: Int) -> Int {
-        // Max kolumner baserat på skärm
         let maxCols: Int
         if width >= 900 { maxCols = 4 }
         else if width >= 700 { maxCols = 3 }
-        else { maxCols = 2 }
+       else { maxCols = 2 }
 
-        // Kandidater: 2..maxCols (typiskt 2,3,4)
         let candidates = Array(2...maxCols)
 
         func score(cols: Int) -> Double {
-            // Hur "bra" blir layouten med cols kolumner?
-            // Lägre score = bättre.
             let rows = Int(ceil(Double(count) / Double(cols)))
             let rem = count % cols
 
-            // Orphan = remainder 1 (t.ex. 9 med 4 => 4+4+1) är fult → stor penalty
             let orphanPenalty: Double = (rem == 1) ? 100.0 : 0.0
 
-            // Lite penalty för remainder != 0 (små ojämnheter), men mycket mindre än orphan
             let unevenPenalty: Double
             if rem == 0 { unevenPenalty = 0.0 }
-            else if rem == 1 { unevenPenalty = 0.0 } // redan straffat hårt ovan
+            else if rem == 1 { unevenPenalty = 0.0 }
             else { unevenPenalty = 4.0 }
 
-            // Färre kolumner ger större kort (bra) → negativ penalty (bonus)
-            // Men på jättestor skärm vill vi inte alltid tvinga 2 kolumner → liten “mot-bonus”
             let sizeBonus: Double = -Double(cols) * 3.0
-
-            // För många rader kan kännas “mycket scroll” → liten penalty
             let rowPenalty: Double = Double(rows) * 1.5
-
-            // Extra: om cols == 4 och count är liten (5–6) blir korten onödigt små → straffa lite
             let smallCountPenalty: Double = (cols == 4 && count <= 6) ? 12.0 : 0.0
 
             return orphanPenalty + unevenPenalty + rowPenalty + smallCountPenalty + sizeBonus
         }
 
-        // Välj den bästa kandidaten
         var best = candidates[0]
         var bestScore = score(cols: best)
 
@@ -273,6 +253,10 @@ private struct SensorCard: View {
         let pctText = rt.percentOfMax.map { "\($0)%" } ?? "—%"
         let zone = rt.percentOfMax.map { HRZone.from(percent: $0) }
 
+        let zoneColor: Color = zone?.color ?? .clear
+        let zoneLabel: String? = zone.map { "\($0.shortLabel) \($0.name)" }
+        let faded: Bool = rt.isStale
+
         let hrFont: Font = compact
             ? .system(size: 46, weight: .bold, design: .rounded)
             : .system(size: 84, weight: .bold, design: .rounded)
@@ -297,7 +281,18 @@ private struct SensorCard: View {
 
                 Spacer()
 
-                VStack(alignment: .trailing, spacing: 4) {
+                VStack(alignment: .trailing, spacing: 6) {
+                    // ✅ Zon-badge
+                    if let zoneLabel {
+                        Text(zoneLabel)
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(zoneColor.opacity(faded ? 0.10 : 0.18), in: Capsule())
+                            .overlay(Capsule().stroke(zoneColor.opacity(faded ? 0.18 : 0.35), lineWidth: 1))
+                            .opacity(faded ? 0.70 : 1.0)
+                    }
+
                     if let b = rt.battery {
                         Label("\(b)%", systemImage: "battery.100")
                             .font(compact ? .caption2 : .caption)
@@ -354,6 +349,7 @@ private struct SensorCard: View {
                     .foregroundStyle(.secondary)
             }
 
+            // ✅ Behåll zonbar om du vill (den är diskret och tydlig)
             if let zone {
                 ZoneBar(zone: zone, isStale: rt.isStale)
             } else {
@@ -364,14 +360,29 @@ private struct SensorCard: View {
         }
         .padding(compact ? 14 : 22)
         .background(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .fill(.ultraThinMaterial)
+            ZStack {
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .fill(.ultraThinMaterial)
+
+                // ✅ Endast svag zon-tint (ingen vänsterlinje)
+                if zone != nil {
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .fill(zoneColor.opacity(faded ? 0.05 : 0.10))
+                }
+            }
         )
         .overlay(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .strokeBorder(borderColor, lineWidth: 1)
+                .strokeBorder(borderColor(zone: zone), lineWidth: 1)
         )
         .shadow(radius: 10, y: 4)
+    }
+
+    private func borderColor(zone: HRZone?) -> Color {
+        if rt.isStale { return .orange.opacity(0.7) }
+        if let z = zone { return z.color.opacity(0.18) }
+        if rt.state == .connected { return .primary.opacity(0.08) }
+        return .primary.opacity(0.05)
     }
 
     private var statusLine: String {
@@ -386,12 +397,6 @@ private struct SensorCard: View {
             return "Frånkopplad"
         }
     }
-
-    private var borderColor: Color {
-        if rt.isStale { return .orange.opacity(0.7) }
-        if rt.state == .connected { return .primary.opacity(0.08) }
-        return .primary.opacity(0.05)
-    }
 }
 
 // MARK: - Zone bar
@@ -402,21 +407,11 @@ private struct ZoneBar: View {
 
     var body: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(color.opacity(isStale ? 0.35 : 0.9))
+            .fill(zone.color.opacity(isStale ? 0.35 : 0.9))
             .frame(height: 10)
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
             )
-    }
-
-    private var color: Color {
-        switch zone {
-        case .z1: return .blue
-        case .z2: return .green
-        case .z3: return .yellow
-        case .z4: return .orange
-        case .z5: return .red
-        }
     }
 }

@@ -1,5 +1,6 @@
-// Version 1.0.11
+// Version 1.0.16
 import Foundation
+import SwiftUI
 
 enum ConnectionState: String, Codable {
     case disconnected
@@ -15,7 +16,7 @@ struct SensorConfig: Identifiable, Codable, Equatable {
     var maxHR: Int               // 60...230
     var autoConnect: Bool
 
-    // ✅ NYTT: kan döljas från dashboard
+    // ✅ kan döljas från dashboard
     var showOnDashboard: Bool = true
 
     static func `default`(id: UUID, name: String) -> SensorConfig {
@@ -80,16 +81,63 @@ struct SensorRuntime: Equatable {
     var percentHistory: [Int] = []
 }
 
-enum HRZone {
+enum HRZone: CaseIterable {
     case z1, z2, z3, z4, z5
 
+    /// Standardzoner baserat på % av maxpuls
     static func from(percent: Int) -> HRZone {
-        switch percent {
+        let p = max(0, min(100, percent))
+        switch p {
         case ..<60: return .z1
         case 60..<70: return .z2
         case 70..<80: return .z3
         case 80..<90: return .z4
         default: return .z5
         }
+    }
+
+    // MARK: - Presentation
+
+    var shortLabel: String {
+        switch self {
+        case .z1: return "Z1"
+        case .z2: return "Z2"
+        case .z3: return "Z3"
+        case .z4: return "Z4"
+        case .z5: return "Z5"
+        }
+    }
+
+    /// Zon-namn anpassade för simning (Z2 kondition, Z3 tröskel)
+    var name: String {
+        switch self {
+        case .z1: return "Lugn"
+        case .z2: return "Kondition"
+        case .z3: return "Tröskel"
+        case .z4: return "Hårt"
+        case .z5: return "Max"
+        }
+    }
+
+    /// Färger som är snygga i både light/dark och inte “skrikiga”.
+    /// (Vi använder sen opacity i UI för bakgrund/ram.)
+    var color: Color {
+        switch self {
+        case .z1: return .cyan
+        case .z2: return .green
+        case .z3: return .yellow
+        case .z4: return .orange
+        case .z5: return .pink
+        }
+    }
+}
+
+// MARK: - Convenience helpers (optional but nice)
+
+extension SensorRuntime {
+    /// Beräknar zon från percentOfMax om det finns.
+    var zone: HRZone? {
+        guard let p = percentOfMax else { return nil }
+        return HRZone.from(percent: p)
     }
 }
