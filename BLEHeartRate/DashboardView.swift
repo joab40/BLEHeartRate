@@ -1,5 +1,4 @@
-
-// Version 1.0.19
+// Version 1.0.20
 import SwiftUI
 
 struct DashboardView: View {
@@ -84,7 +83,6 @@ struct DashboardView: View {
                 Label(ble.bluetoothText, systemImage: ble.isPoweredOn ? "bolt.heart" : "bolt.slash")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-
                 Spacer()
             }
             .padding(.horizontal)
@@ -318,7 +316,7 @@ private struct SensorCard: View {
                 }
             }
 
-            // ✅ Sparkline med "Span" + "Senast" overlay (flyttad till TOPP för att inte krocka med 0%)
+            // ✅ Sparkline med "Span" + "Senast" RAD ovanför grafen (inte overlay på grafytan)
             TimelineView(.periodic(from: .now, by: 1.0)) { context in
                 let now = context.date
 
@@ -328,12 +326,7 @@ private struct SensorCard: View {
                 let spanText = spanSeconds.map { "Span: \(formatSpan(seconds: $0))" } ?? "Span: —"
                 let lastText = lastAgeSeconds.map { "Senast: \(formatSpan(seconds: $0))" } ?? "Senast: —"
 
-                ZStack(alignment: .top) {
-                    SparklineView(values: downsample(rt.percentHistory, target: sparkTargetPoints))
-                        .frame(height: sparkHeight)
-                        .opacity(rt.percentHistory.isEmpty ? 0.55 : 1.0)
-
-                    // HUD-overlay överst (krockar inte med 0% nere)
+                VStack(spacing: compact ? 4 : 6) {
                     HStack {
                         Text(spanText)
                         Spacer()
@@ -341,17 +334,11 @@ private struct SensorCard: View {
                     }
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.top, 6)
-                    .padding(.bottom, 2)
-                    .background(
-                        // diskret bakgrund för läsbarhet ovanpå grafen
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(.ultraThinMaterial)
-                            .opacity(0.9)
-                    )
                     .padding(.horizontal, 6)
-                    .padding(.top, 4)
+
+                    SparklineView(values: downsample(rt.percentHistory, target: sparkTargetPoints))
+                        .frame(height: sparkHeight)
+                        .opacity(rt.percentHistory.isEmpty ? 0.55 : 1.0)
                 }
             }
 
