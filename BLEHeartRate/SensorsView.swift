@@ -1,4 +1,4 @@
-// Version 1.0.14 ( förenklad )
+// Version 1.0.15
 import SwiftUI
 
 struct SensorsView: View {
@@ -27,8 +27,6 @@ struct SensorsView: View {
         }
     }
 
-    // MARK: - Sections
-
     private var savedSection: some View {
         Section(header: Text("Mina sensorer")) {
             if ble.sensorConfigs.isEmpty {
@@ -37,7 +35,6 @@ struct SensorsView: View {
             } else {
                 ForEach(ble.sensorConfigs) { cfg in
                     let rt = ble.runtime[cfg.id]
-
                     SensorConfigRow(
                         cfg: cfg,
                         rt: rt,
@@ -65,12 +62,11 @@ struct SensorsView: View {
     private var discoveredSection: some View {
         Section(header: Text("Upptäckta")) {
 
-            // ✅ Tydlig Scan/Stop-rad INNE i vyn (syns alltid på iPad)
             ScanControlRow(
                 isPoweredOn: ble.isPoweredOn,
                 isScanning: ble.isScanning,
-                onStart: { ble.startScan() },
-                onStop: { ble.stopScan() }
+                onStart: { ble.userStartScanning() },
+                onStop: { ble.userStopScanning() }
             )
 
             if !ble.isPoweredOn {
@@ -92,19 +88,15 @@ struct SensorsView: View {
         }
     }
 
-    // MARK: - Toolbar
-
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
-
-            // (Behåll toolbar-knapparna också – bra på iPhone)
             if ble.isScanning {
-                Button { ble.stopScan() } label: {
+                Button { ble.userStopScanning() } label: {
                     Label("Stop", systemImage: "stop.circle")
                 }
             } else {
-                Button { ble.startScan() } label: {
+                Button { ble.userStartScanning() } label: {
                     Label("Scan", systemImage: "magnifyingglass")
                 }
             }
@@ -115,8 +107,6 @@ struct SensorsView: View {
         }
     }
 
-    // MARK: - Actions
-
     private func deleteSaved(at offsets: IndexSet) {
         let idsToDelete: [UUID] = offsets.map { ble.sensorConfigs[$0].id }
         for id in idsToDelete {
@@ -125,7 +115,7 @@ struct SensorsView: View {
     }
 }
 
-// MARK: - Scan control row (NEW)
+// MARK: - Scan control row
 
 private struct ScanControlRow: View {
     let isPoweredOn: Bool

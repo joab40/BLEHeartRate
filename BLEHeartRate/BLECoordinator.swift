@@ -1,4 +1,4 @@
-// Version 1.0.14
+// Version 1.0.15
 import Foundation
 import Combine
 import CoreBluetooth
@@ -15,6 +15,15 @@ final class BLECoordinator: NSObject, ObservableObject {
     @Published var bluetoothText: String = "Bluetooth…"
 
     @Published var discovered: [DiscoveredSensor] = []
+
+    // MARK: - Scan control (Auto vs manual off)
+
+    enum ScanMode: Equatable {
+        case auto
+        case manualOff
+    }
+
+    @Published private(set) var scanMode: ScanMode = .auto
 
     // MARK: - BLE constants
 
@@ -42,10 +51,7 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     // MARK: - Persistence keys
 
-    /// Current key we will write to
     private let configsKey = "BLEHeartRate.SensorConfigs.v2"
-
-    /// Known legacy keys to try first
     private let legacyConfigKeys: [String] = [
         "BLEHeartRate.SensorConfigs",
         "BLEHeartRate.SensorConfigs.v1",
@@ -54,14 +60,12 @@ final class BLECoordinator: NSObject, ObservableObject {
         "savedSensors"
     ]
 
-    /// Set to true if you want console logs for debugging UserDefaults migration
-    private let debugMigrationLogs = true
+    private let debugMigrationLogs = false
 
     // MARK: - Init
 
     override init() {
         super.init()
-
         central = CBCentralManager(delegate: self, queue: DispatchQueue(label: "ble.central.queue"))
 
         loadConfigsWithAutoDetectMigration()
@@ -74,7 +78,25 @@ final class BLECoordinator: NSObject, ObservableObject {
         tickTimer = nil
     }
 
-    // MARK: - Public API
+    // MARK: - Public API (Views)
+
+    /// User pressed Scan in SensorsView (enables auto mode and starts scanning)
+    func userStartScanning() {
+        scanMode = .auto
+        startScan()
+    }
+
+    /// User pressed Stop in SensorsView (manual override OFF)
+    func userStopScanning() {
+        scanMode = .manualOff
+        stopScan()
+    }
+
+    /// Auto/Coordinator calls this when it needs to scan (respects manualOff)
+    private func startScanIfAllowed() {
+        guard scanMode == .auto else { return }
+        startScan()
+    }
 
     func startScan() {
         guard isPoweredOn else { return }
@@ -93,6 +115,7 @@ final class BLECoordinator: NSObject, ObservableObject {
     func stopScan() {
         isScanning = false
         central.stopScan()
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.bluetoothText = self.isPoweredOn ? "Bluetooth på" : "Bluetooth av"
@@ -114,7 +137,8 @@ final class BLECoordinator: NSObject, ObservableObject {
             return
         }
 
-        startScan()
+        // No peripheral handle yet -> scan (if allowed)
+        startScanIfAllowed()
     }
 
     func disconnect(id: UUID) {
@@ -176,6 +200,7 @@ final class BLECoordinator: NSObject, ObservableObject {
     private func tick() {
         let now = Date()
 
+        // Update stale/seen
         for cfg in sensorConfigs {
             var rt = runtime[cfg.id] ?? SensorRuntime()
 
@@ -191,19 +216,34 @@ final class BLECoordinator: NSObject, ObservableObject {
             runtime[cfg.id] = rt
         }
 
+        // Opportunistic RSSI reads
         for (id, p) in peripherals where p.state == .connected {
             if (runtime[id]?.isStale ?? false) || (runtime[id]?.lastHRAt == nil) {
                 p.readRSSI()
             }
         }
 
+        // Auto-reconnect
+        var anyAutoNeedsHelp = false
+
         for cfg in sensorConfigs {
             let id = cfg.id
             let rt = runtime[id] ?? SensorRuntime()
             let shouldWant = wantedConnected.contains(id) || cfg.autoConnect
             guard shouldWant else { continue }
-            guard rt.state == .disconnected else { continue }
-            attemptReconnect(id: id, now: now)
+
+            if rt.state == .disconnected {
+                attemptReconnect(id: id, now: now)
+                // If we don't have a peripheral handle yet, scanning may be needed
+                if peripherals[id] == nil {
+                    anyAutoNeedsHelp = true
+                }
+            }
+        }
+
+        // If we have auto sensors that need help and scanning is allowed -> scan
+        if anyAutoNeedsHelp && scanMode == .auto && isPoweredOn && !isScanning {
+            startScan()
         }
     }
 
@@ -239,7 +279,8 @@ final class BLECoordinator: NSObject, ObservableObject {
         if let p = peripherals[id] {
             connectPeripheral(p, reason: "auto reconnect")
         } else {
-            startScan()
+            // No peripheral handle -> scan if allowed
+            startScanIfAllowed()
         }
     }
 
@@ -247,67 +288,80 @@ final class BLECoordinator: NSObject, ObservableObject {
         reconnectPolicy[id] = ReconnectPolicy(attemptCount: 0, nextAllowedAt: .distantPast)
     }
 
+    // MARK: - Bootstrap known peripherals (best practice)
+
+    private func bootstrapKnownPeripheralsAndConnectAuto() {
+        guard isPoweredOn else { return }
+        let ids = sensorConfigs.map(\.id)
+        guard !ids.isEmpty else { return }
+
+        // Retrieve previously known peripherals by identifier (fast path)
+        let retrieved = central.retrievePeripherals(withIdentifiers: ids)
+        for p in retrieved {
+            peripherals[p.identifier] = p
+        }
+
+        // Also retrieve currently connected peripherals that expose HR service
+        let connected = central.retrieveConnectedPeripherals(withServices: [hrService])
+        for p in connected {
+            peripherals[p.identifier] = p
+        }
+
+        // Connect those that should auto-connect
+        for cfg in sensorConfigs where cfg.autoConnect {
+            if let p = peripherals[cfg.id] {
+                connectPeripheral(p, reason: "bootstrap autoConnect")
+            }
+        }
+
+        // If still missing some auto sensors -> scan (unless user turned it off)
+        let anyMissing = sensorConfigs.contains { $0.autoConnect && peripherals[$0.id] == nil }
+        if anyMissing {
+            startScanIfAllowed()
+        }
+    }
+
     // MARK: - Persistence (AUTO-DETECT + MIGRATION)
 
     private func loadConfigsWithAutoDetectMigration() {
-        // 1) Try current key
         if let decoded = decodeConfigs(forKey: configsKey) {
             sensorConfigs = decoded
-            if debugMigrationLogs {
-                print("✅ Loaded SensorConfigs from current key:", configsKey, "count:", decoded.count)
-            }
+            if debugMigrationLogs { print("✅ Loaded current key:", configsKey, decoded.count) }
             return
         }
 
-        // 2) Try known legacy keys
         for key in legacyConfigKeys {
             if let decoded = decodeConfigs(forKey: key) {
                 sensorConfigs = decoded
-                saveConfigs() // migrate to current key
-                if debugMigrationLogs {
-                    print("✅ Migrated SensorConfigs from legacy key:", key, "→", configsKey, "count:", decoded.count)
-                }
+                saveConfigs()
+                if debugMigrationLogs { print("✅ Migrated legacy key:", key, decoded.count) }
                 return
             }
         }
 
-        // 3) Heuristic scan: try decode from ANY Data entry in UserDefaults
         let all = UserDefaults.standard.dictionaryRepresentation()
-
-        if debugMigrationLogs {
-            print("🔎 Heuristic scan UserDefaults keys:", all.keys.count)
-        }
-
         for (key, value) in all {
             guard let data = value as? Data else { continue }
-
             guard let decoded = try? JSONDecoder().decode([SensorConfig].self, from: data) else { continue }
             guard isPlausibleConfigs(decoded) else { continue }
 
             sensorConfigs = decoded
-            saveConfigs() // migrate to current key
-            if debugMigrationLogs {
-                print("✅ Auto-detected SensorConfigs in key:", key, "→", configsKey, "count:", decoded.count)
-            }
+            saveConfigs()
+            if debugMigrationLogs { print("✅ Auto-detected key:", key, decoded.count) }
             return
         }
 
-        // If still nothing: likely new bundle id / new app sandbox
         sensorConfigs = []
-        if debugMigrationLogs {
-            print("⚠️ No saved sensors found in UserDefaults. If you changed Bundle Identifier, old data is in the old app sandbox.")
-        }
+        if debugMigrationLogs { print("⚠️ No configs found") }
     }
 
     private func decodeConfigs(forKey key: String) -> [SensorConfig]? {
         guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
-        guard let decoded = try? JSONDecoder().decode([SensorConfig].self, from: data) else { return nil }
-        return decoded
+        return try? JSONDecoder().decode([SensorConfig].self, from: data)
     }
 
     private func isPlausibleConfigs(_ arr: [SensorConfig]) -> Bool {
         guard !arr.isEmpty else { return false }
-        // sanity checks to avoid false positives
         for c in arr {
             if c.maxHR < 60 || c.maxHR > 240 { return false }
             if c.avatar.isEmpty { return false }
@@ -443,7 +497,8 @@ extension BLECoordinator: CBCentralManagerDelegate {
         }
 
         if powered {
-            reconnectAllAuto()
+            // ✅ Best practice: retrieve known peripherals then connect / scan if needed
+            bootstrapKnownPeripheralsAndConnectAuto()
         } else {
             stopScan()
         }
