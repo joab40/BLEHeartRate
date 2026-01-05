@@ -1,4 +1,4 @@
-// Version 1.0.13
+// Version 1.0.14
 import SwiftUI
 
 struct DashboardView: View {
@@ -41,7 +41,7 @@ struct DashboardView: View {
 
                 } else {
                     ScrollView {
-                        let cols = smartGridCols(width: geo.size.width, count: visibleCount)
+                        let cols = optimizedGridCols(width: geo.size.width, count: visibleCount)
 
                         LazyVGrid(
                             columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: cols),
@@ -70,7 +70,6 @@ struct DashboardView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("HR Monitor")
             .toolbar { toolbarContent }
-            // ✅ minimera “flicker” vid många runtime-uppdateringar
             .transaction { tx in tx.animation = nil }
         }
     }
@@ -132,9 +131,6 @@ struct DashboardView: View {
                             runtimes: [UUID: SensorRuntime],
                             isWide: Bool) -> some View {
         let spacing: CGFloat = 14
-
-        // ✅ när 3–4 sensorer (2x2) måste korten vara compact för att få plats
-        // 2 sensorer på smal skärm blir också bättre som compact
         let useCompactForFill: Bool = (configs.count >= 3) || (!isWide && configs.count == 2)
 
         switch configs.count {
@@ -210,27 +206,58 @@ struct DashboardView: View {
         }
     }
 
-    // MARK: Smart cols for 5+
+    // MARK: Optimized cols for 5+
 
-    private func smartGridCols(width: CGFloat, count: Int) -> Int {
-        // Bas utifrån skärm
-        var cols: Int
-        if width >= 900 { cols = 4 }
-        else if width >= 700 { cols = 3 }
-        else { cols = 2 }
+    private func optimizedGridCols(width: CGFloat, count: Int) -> Int {
+        // Max kolumner baserat på skärm
+        let maxCols: Int
+        if width >= 900 { maxCols = 4 }
+        else if width >= 700 { maxCols = 3 }
+        else { maxCols = 2 }
 
-        // För 5–6 sensorer på bred skärm: 3 kolumner ger större kort (3+2, 3+3)
-        if cols == 4 && count <= 6 {
-            cols = 3
+        // Kandidater: 2..maxCols (typiskt 2,3,4)
+        let candidates = Array(2...maxCols)
+
+        func score(cols: Int) -> Double {
+            // Hur "bra" blir layouten med cols kolumner?
+            // Lägre score = bättre.
+            let rows = Int(ceil(Double(count) / Double(cols)))
+            let rem = count % cols
+
+            // Orphan = remainder 1 (t.ex. 9 med 4 => 4+4+1) är fult → stor penalty
+            let orphanPenalty: Double = (rem == 1) ? 100.0 : 0.0
+
+            // Lite penalty för remainder != 0 (små ojämnheter), men mycket mindre än orphan
+            let unevenPenalty: Double
+            if rem == 0 { unevenPenalty = 0.0 }
+            else if rem == 1 { unevenPenalty = 0.0 } // redan straffat hårt ovan
+            else { unevenPenalty = 4.0 }
+
+            // Färre kolumner ger större kort (bra) → negativ penalty (bonus)
+            // Men på jättestor skärm vill vi inte alltid tvinga 2 kolumner → liten “mot-bonus”
+            let sizeBonus: Double = -Double(cols) * 3.0
+
+            // För många rader kan kännas “mycket scroll” → liten penalty
+            let rowPenalty: Double = Double(rows) * 1.5
+
+            // Extra: om cols == 4 och count är liten (5–6) blir korten onödigt små → straffa lite
+            let smallCountPenalty: Double = (cols == 4 && count <= 6) ? 12.0 : 0.0
+
+            return orphanPenalty + unevenPenalty + rowPenalty + smallCountPenalty + sizeBonus
         }
 
-        // Undvik "ensam" sista rad (t.ex. 9 med 4 => 4+4+1, bättre: 3+3+3)
-        if cols > 2 && (count % cols) == 1 {
-            cols -= 1
-        }
+        // Välj den bästa kandidaten
+        var best = candidates[0]
+        var bestScore = score(cols: best)
 
-        // Safety: minst 2 kolumner
-        return max(2, cols)
+        for c in candidates.dropFirst() {
+            let s = score(cols: c)
+            if s < bestScore {
+                bestScore = s
+                best = c
+            }
+        }
+        return best
     }
 }
 
@@ -250,7 +277,6 @@ private struct SensorCard: View {
             ? .system(size: 46, weight: .bold, design: .rounded)
             : .system(size: 84, weight: .bold, design: .rounded)
 
-        // ✅ större sparkline, men inte så stor att 2x2 spricker
         let sparkHeight: CGFloat = compact ? 64 : 120
 
         VStack(alignment: .leading, spacing: compact ? 10 : 16) {
