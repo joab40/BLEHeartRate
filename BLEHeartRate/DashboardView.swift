@@ -1,4 +1,4 @@
-// Version 1.0.12
+// Version 1.0.13
 import SwiftUI
 
 struct DashboardView: View {
@@ -41,7 +41,8 @@ struct DashboardView: View {
 
                 } else {
                     ScrollView {
-                        let cols = gridColsForMany(width: geo.size.width)
+                        let cols = smartGridCols(width: geo.size.width, count: visibleCount)
+
                         LazyVGrid(
                             columns: Array(repeating: GridItem(.flexible(), spacing: 14), count: cols),
                             spacing: 14
@@ -132,15 +133,15 @@ struct DashboardView: View {
                             isWide: Bool) -> some View {
         let spacing: CGFloat = 14
 
-        // ✅ Viktigt: när 3–4 sensorer (2x2) måste korten bli "compact" för att få plats
-        // Även 2 sensorer på smal skärm (iPhone portrait) blir bättre som compact.
+        // ✅ när 3–4 sensorer (2x2) måste korten vara compact för att få plats
+        // 2 sensorer på smal skärm blir också bättre som compact
         let useCompactForFill: Bool = (configs.count >= 3) || (!isWide && configs.count == 2)
 
         switch configs.count {
         case 1:
             let cfg = configs[0]
             let rt = runtimes[cfg.id] ?? SensorRuntime()
-            SensorCard(cfg: cfg, rt: rt, compact: false) // 1 sensor: stort kort
+            SensorCard(cfg: cfg, rt: rt, compact: false)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal)
                 .padding(.bottom, 18)
@@ -177,7 +178,7 @@ struct DashboardView: View {
                 HStack(spacing: spacing) {
                     ForEach(top) { cfg in
                         let rt = runtimes[cfg.id] ?? SensorRuntime()
-                        SensorCard(cfg: cfg, rt: rt, compact: true) // ✅ alltid compact i 2x2
+                        SensorCard(cfg: cfg, rt: rt, compact: true)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
@@ -190,7 +191,7 @@ struct DashboardView: View {
                     } else {
                         ForEach(bottom) { cfg in
                             let rt = runtimes[cfg.id] ?? SensorRuntime()
-                            SensorCard(cfg: cfg, rt: rt, compact: true) // ✅ alltid compact i 2x2
+                            SensorCard(cfg: cfg, rt: rt, compact: true)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                         if bottom.count == 1 {
@@ -209,10 +210,27 @@ struct DashboardView: View {
         }
     }
 
-    private func gridColsForMany(width: CGFloat) -> Int {
-        if width >= 900 { return 4 }
-        if width >= 700 { return 3 }
-        return 2
+    // MARK: Smart cols for 5+
+
+    private func smartGridCols(width: CGFloat, count: Int) -> Int {
+        // Bas utifrån skärm
+        var cols: Int
+        if width >= 900 { cols = 4 }
+        else if width >= 700 { cols = 3 }
+        else { cols = 2 }
+
+        // För 5–6 sensorer på bred skärm: 3 kolumner ger större kort (3+2, 3+3)
+        if cols == 4 && count <= 6 {
+            cols = 3
+        }
+
+        // Undvik "ensam" sista rad (t.ex. 9 med 4 => 4+4+1, bättre: 3+3+3)
+        if cols > 2 && (count % cols) == 1 {
+            cols -= 1
+        }
+
+        // Safety: minst 2 kolumner
+        return max(2, cols)
     }
 }
 
