@@ -1,222 +1,243 @@
 // SensorsView.swift
-// Version 1.0.24
-// NOTE (Scanning strategy):
-// - För att slippa build-fel när BLECoordinator ändrar startScan-signatur/access,
-//   använder vi ENBART ble.userStartScanning() / ble.userStopScanning() från UI.
-// - “Upptäckta” bygger på ble.discovered som uppdateras av didDiscover i BLECoordinator.
-// - “Mina sensorer” är ble.sensorConfigs (persistade) och kan editas/sparas här.
+// Version 1.0.25
+// NOTE (Scanning + Tuning):
+// - “Scan” i denna vy kör broad scan (withServices: nil) för att hitta nya enheter som inte alltid annonserar 180D.
+// - “Stop” stänger av auto-scan (scanMode = manualOff).
+// - Under “BLE tuning” kan du justera globala timeouts/holdoffs (Variant A). De gäller alla sensorer och sparas lokalt.
 
 import SwiftUI
 
 struct SensorsView: View {
     @EnvironmentObject private var ble: BLECoordinator
 
-    @State private var editing: SensorConfig? = nil
-
     var body: some View {
         List {
-            Section {
-                HStack {
-                    Label(ble.bluetoothText, systemImage: ble.isPoweredOn ? "bolt.heart" : "bolt.slash")
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if ble.isScanning {
-                        Text("Skannar…").foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            Section("Mina sensorer") {
-                if ble.sensorConfigs.isEmpty {
-                    Text("Inga sparade sensorer ännu.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(ble.sensorConfigs) { cfg in
-                        let rt = ble.runtime[cfg.id] ?? SensorRuntime()
-                        SensorRow(cfg: cfg, rt: rt,
-                                  onConnect: { ble.connect(id: cfg.id) },
-                                  onDisconnect: { ble.disconnect(id: cfg.id) },
-                                  onEdit: { editing = cfg })
-                    }
-                    .onDelete { idx in
-                        for i in idx {
-                            let id = ble.sensorConfigs[i].id
-                            ble.removeSensor(id: id)
-                        }
-                    }
-                }
-            }
-
-            Section("Upptäckta (HR via BLE)") {
-                if ble.discovered.isEmpty {
-                    Text("Tryck Scan för att leta efter pulssensorer.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(ble.discovered) { d in
-                        DiscoveredRow(d: d,
-                                      isAlreadySaved: ble.sensorConfigs.contains(where: { $0.id == d.id }),
-                                      onAdd: { ble.addDiscovered(id: d.id, name: d.name) })
-                    }
-                }
-            }
+            statusSection
+            scanSection
+            tuningSection
+            savedSection
+            discoveredSection
         }
         .navigationTitle("Sensorer")
-        .toolbar { toolbarContent }
-        .sheet(item: $editing) { cfg in
-            EditSensorSheet(cfg: cfg) { updated in
-                ble.upsertSensor(updated)
+        .onAppear {
+            // När man öppnar SensorsView vill man ofta se nya enheter direkt
+            if ble.scanMode == .auto, !ble.isScanning {
+                ble.startBroadScan()
             }
         }
     }
 
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        ToolbarItemGroup(placement: .topBarTrailing) {
+    // MARK: - Sections
+
+    private var statusSection: some View {
+        Section {
+            HStack {
+                Label(ble.bluetoothText, systemImage: ble.isPoweredOn ? "bolt.heart" : "bolt.slash")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if ble.isPoweredOn {
+                    Image(systemName: ble.isScanning ? "dot.radiowaves.left.and.right" : "checkmark.circle")
+                        .foregroundStyle(ble.isScanning ? .blue : .green)
+                }
+            }
+        }
+    }
+
+    private var scanSection: some View {
+        Section("Skanning") {
             if ble.isScanning {
-                Button { ble.userStopScanning() } label: {
+                Button {
+                    ble.userStopScanning()
+                } label: {
                     Label("Stop", systemImage: "stop.circle")
                 }
             } else {
-                Button { ble.userStartScanning() } label: {
+                Button {
+                    ble.userStartScanning()
+                } label: {
                     Label("Scan", systemImage: "magnifyingglass")
+                }
+            }
+
+            if ble.scanMode == .manualOff {
+                Text("Auto-scan är avstängt (manuellt). Tryck “Scan” för att slå på igen.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var tuningSection: some View {
+        Section {
+            Stepper(value: bindingInt(\.staleSoftSeconds), in: 2...30) {
+                LabeledContent("Soft stale (s)") {
+                    Text("\(ble.tuning.staleSoftSeconds)")
+                }
+            }
+
+            Stepper(value: bindingInt(\.staleHardResetSeconds), in: 6...60) {
+                LabeledContent("Hard reset (s)") {
+                    Text("\(ble.tuning.staleHardResetSeconds)")
+                }
+            }
+
+            Stepper(value: bindingDouble(\.postHardResetHoldoffSeconds), in: 0.0...5.0, step: 0.1) {
+                LabeledContent("Holdoff efter hard reset (s)") {
+                    Text(String(format: "%.1f", ble.tuning.postHardResetHoldoffSeconds))
+                }
+            }
+
+            Stepper(value: bindingDouble(\.minConnectAttemptInterval), in: 0.0...5.0, step: 0.1) {
+                LabeledContent("Min connect-intervall (s)") {
+                    Text(String(format: "%.1f", ble.tuning.minConnectAttemptInterval))
+                }
+            }
+
+            Stepper(value: bindingDouble(\.minRSSIInterval), in: 0.2...5.0, step: 0.1) {
+                LabeledContent("Min RSSI-intervall (s)") {
+                    Text(String(format: "%.1f", ble.tuning.minRSSIInterval))
+                }
+            }
+
+            Button(role: .destructive) {
+                ble.tuning = .default
+            } label: {
+                Label("Återställ BLE tuning", systemImage: "arrow.counterclockwise")
+            }
+        } header: {
+            Text("BLE tuning (globalt)")
+        } footer: {
+            Text("Tips: Om appen reconnect-loopar efter att simmaren varit utom räckhåll, höj “Hard reset (s)” och/eller “Holdoff”. Om du vill se ‘signal tappad’ tidigare i UI, sänk “Soft stale (s)”.")
+        }
+    }
+
+    private var savedSection: some View {
+        Section("Sparade sensorer") {
+            if ble.sensorConfigs.isEmpty {
+                Text("Inga sparade sensorer ännu.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(ble.sensorConfigs) { cfg in
+                    SensorRow(cfg: cfg, rt: ble.runtime[cfg.id] ?? SensorRuntime())
+                        .swipeActions(allowsFullSwipe: false) {
+                            Button(role: .destructive) { ble.removeSensor(id: cfg.id) } label: {
+                                Label("Ta bort", systemImage: "trash")
+                            }
+                        }
+                        .contextMenu {
+                            Button("Connect") { ble.connect(id: cfg.id) }
+                            Button("Disconnect") { ble.disconnect(id: cfg.id) }
+                        }
                 }
             }
         }
     }
+
+    private var discoveredSection: some View {
+        Section("Upptäckta enheter") {
+            if ble.discovered.isEmpty {
+                Text("Inga enheter upptäckta ännu. Tryck “Scan”.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(ble.discovered) { d in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(d.name)
+                                .font(.headline)
+                                .lineLimit(1)
+                            Text(d.id.uuidString)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+
+                        if let rssi = d.rssi {
+                            Text("\(rssi) dBm")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Button("Lägg till") {
+                            ble.addDiscovered(id: d.id, name: d.name)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Helpers (Bindings)
+
+    private func bindingInt(_ kp: WritableKeyPath<BLEGlobalTuning, Int>) -> Binding<Int> {
+        Binding(
+            get: { ble.tuning[keyPath: kp] },
+            set: { newValue in
+                var t = ble.tuning
+                t[keyPath: kp] = newValue
+                ble.tuning = t
+            }
+        )
+    }
+
+    private func bindingDouble(_ kp: WritableKeyPath<BLEGlobalTuning, TimeInterval>) -> Binding<Double> {
+        Binding(
+            get: { ble.tuning[keyPath: kp] },
+            set: { newValue in
+                var t = ble.tuning
+                t[keyPath: kp] = newValue
+                ble.tuning = t
+            }
+        )
+    }
 }
+
+// MARK: - Row
 
 private struct SensorRow: View {
     let cfg: SensorConfig
     let rt: SensorRuntime
-    let onConnect: () -> Void
-    let onDisconnect: () -> Void
-    let onEdit: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(cfg.avatar).font(.title2)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(cfg.displayName).font(.headline).lineLimit(1)
-                    Text(statusLine)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button { onEdit() } label: {
-                    Image(systemName: "slider.horizontal.3")
-                }
-                .buttonStyle(.borderless)
-            }
+        HStack(spacing: 12) {
+            Text(cfg.avatar)
+                .font(.system(size: 28))
 
-            HStack(spacing: 12) {
-                Text("Max \(cfg.maxHR)")
+            VStack(alignment: .leading, spacing: 4) {
+                Text(cfg.displayName).font(.headline)
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
 
-                if let hr = rt.hr {
-                    Text("\(hr) bpm")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(rt.hr.map(String.init) ?? "—")
+                    .font(.title3.weight(.semibold))
 
                 if let pct = rt.percentOfMax {
-                    let z = HRZone.from(percent: pct)
-                    Text("\(z.shortLabel) \(pct)%")
+                    Text("\(HRZone.from(percent: pct).shortLabel)")
                         .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(z.color.opacity(0.18), in: Capsule())
-                }
-
-                Spacer()
-
-                if rt.state == .connected || rt.state == .connecting {
-                    Button("Disconnect") { onDisconnect() }
-                        .buttonStyle(.bordered)
-                } else {
-                    Button("Connect") { onConnect() }
-                        .buttonStyle(.borderedProminent)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
-        .padding(.vertical, 4)
+        .contentShape(Rectangle())
     }
 
-    private var statusLine: String {
+    private var statusText: String {
         switch rt.state {
-        case .connected: return rt.isStale ? "Ansluten • signal tappad" : "Ansluten • OK"
-        case .connecting: return "Ansluter…"
-        case .scanning: return "Skannar…"
-        case .disconnected: return "Frånkopplad"
-        }
-    }
-}
-
-private struct DiscoveredRow: View {
-    let d: DiscoveredSensor
-    let isAlreadySaved: Bool
-    let onAdd: () -> Void
-
-    var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(d.name).font(.headline).lineLimit(1)
-                Text(d.rssi.map { "\($0) dBm" } ?? "RSSI —")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if isAlreadySaved {
-                Text("Sparad")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            } else {
-                Button("Lägg till") { onAdd() }
-                    .buttonStyle(.borderedProminent)
-            }
-        }
-    }
-}
-
-private struct EditSensorSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var cfg: SensorConfig
-    let onSave: (SensorConfig) -> Void
-
-    init(cfg: SensorConfig, onSave: @escaping (SensorConfig) -> Void) {
-        _cfg = State(initialValue: cfg)
-        self.onSave = onSave
-    }
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Profil") {
-                    TextField("Namn", text: $cfg.displayName)
-                    TextField("Avatar", text: $cfg.avatar)
-                    Stepper("Maxpuls: \(cfg.maxHR)", value: $cfg.maxHR, in: 60...240)
-                }
-
-                Section("Beteende") {
-                    Toggle("Auto-connect", isOn: $cfg.autoConnect)
-                    Toggle("Visa i Dashboard", isOn: $cfg.showOnDashboard)
-                }
-            }
-            .navigationTitle("Redigera sensor")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Avbryt") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Spara") {
-                        onSave(cfg)
-                        dismiss()
-                    }
-                    .font(.headline)
-                }
-            }
+        case .connected:
+            return rt.isStale ? "Ansluten • stale" : "Ansluten"
+        case .connecting:
+            return "Ansluter…"
+        case .scanning:
+            return "Skannar…"
+        case .disconnected:
+            return "Frånkopplad"
         }
     }
 }

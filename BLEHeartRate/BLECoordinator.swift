@@ -1,20 +1,52 @@
-
-// Version 1.0.23
+// BLECoordinator.swift
+// Version 1.0.25
 // NOTE (Pool/BLE strategy):
-// - Undvik att kalla readRSSI() på varje HR-notification: det kan störa HR-notify-flödet när många sensorer kör samtidigt.
-// - Läs RSSI throttlat (t.ex. max 1 gång/sek per sensor, och extra vid “stale”) för stabilare och snabbare HR-uppdateringar.
-// - Använd en “stale watchdog”: om en sensor är .connected men inte skickat HR på X sek (t.ex. 12s),
-//   forcera reconnect (cancelPeripheralConnection) eftersom “silent links” ofta uppstår när sensorn är under vatten.
-// - Lägg en kort holdoff efter hard reset (t.ex. 0.7s) för att undvika reconnect-loop när sensorn precis doppar/kommer upp.
-// - Reconnect backoff ska vara aggressiv tidigt (0–1.5s) för att fånga upp signal direkt när sensorn kommer upp över ytan.
-// - Vid didDiscover för en “wanted” sensor: om den är disconnected/stale → prioritera reconnect, men respektera holdoff.
-// NOTE (Scanning):
-// - Auto-scan kan vara HR-only (withServices: [180D]) för effektivitet.
-// - Manuell scan i SensorsView bör vara “broad scan” (withServices: nil) för att hitta nya enheter som inte alltid annonserar 180D.
+// - Läs HR via notify på 0x180D / 0x2A37 (Heart Rate Measurement).
+// - Undvik readRSSI() på varje HR-notification (kan störa när många sensorer kör samtidigt).
+// - RSSI läses throttlat (default 1 gång/sek per sensor) + vid behov.
+// - “Stale watchdog” (pool-case):
+//   * Soft stale = UI-varning när vi inte fått HR på X sek.
+//   * Hard reset = om vi varit tysta länge medan vi fortfarande är “connected” → cancelPeripheralConnection()
+//     (för att bryta “silent link” när sensorn varit under vatten).
+// - Viktigt för stabilitet:
+//   * När vi reconnectar nollställer vi lastHRAt/lastSeen så watchdog inte triggar direkt på “gammal” timestamp.
+//   * Efter hard reset finns en kort holdoff så sensorn hinner boota/annonsera innan vi försöker igen.
+// - Scanning:
+//   * Auto-scan (för autoConnect) är HR-only (withServices: [180D]) för effektivitet.
+//   * Manuell scan i SensorsView är “broad scan” (withServices: nil) för att hitta nya enheter som inte alltid annonserar 180D.
+//
+// NOTE (Tuning / Variant A):
+// - Appen har en global “BLE tuning”-profil (gäller alla sensorer) som kan justeras i SensorsView.
+// - Default-värden ligger i BLEGlobalTuning.default, och sparas i UserDefaults när du ändrar i UI.
 
 import Foundation
 import Combine
 import CoreBluetooth
+
+// MARK: - Global tuning (Variant A)
+
+struct BLEGlobalTuning: Codable, Equatable {
+    // UI stale marker
+    var staleSoftSeconds: Int = 6
+
+    // Pool watchdog: connected-but-silent → hard reset
+    var staleHardResetSeconds: Int = 12
+
+    // Holdoff after hard reset (avoid reconnect-loop + allow device to announce)
+    var postHardResetHoldoffSeconds: TimeInterval = 0.7
+
+    // Anti-spam connect attempts
+    var minConnectAttemptInterval: TimeInterval = 0.8
+
+    // RSSI read throttle
+    var minRSSIInterval: TimeInterval = 1.0
+
+    // Reconnect backoff ladder (aggressive early)
+    // NOTE: Values are "time until next attempt" based on attemptCount.
+    var reconnectDelays: [TimeInterval] = [0.0, 0.2, 0.5, 1.0, 1.5, 2.0]
+
+    static let `default` = BLEGlobalTuning()
+}
 
 final class BLECoordinator: NSObject, ObservableObject {
 
@@ -28,6 +60,11 @@ final class BLECoordinator: NSObject, ObservableObject {
     @Published var bluetoothText: String = "Bluetooth…"
 
     @Published var discovered: [DiscoveredSensor] = []
+
+    // Global tuning (Variant A)
+    @Published var tuning: BLEGlobalTuning = .default {
+        didSet { saveTuning() }
+    }
 
     // MARK: - Scan control (Auto vs manual off)
 
@@ -63,20 +100,11 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     // MARK: - RSSI policy (throttled)
 
-    private let minRSSIInterval: TimeInterval = 1.0           // max 1 RSSI-read/sek per sensor
     private var lastRSSIReadAt: [UUID: Date] = [:]
 
-    // MARK: - Pool watchdog (connected-but-silent)
+    // MARK: - Pool watchdog + gating
 
-    private let staleSoftSeconds: Int = 6                     // UI “stale”
-    private let staleHardResetSeconds: Int = 12               // hård reset (pool)
-
-    // Holdoff efter hard reset (undvik reconnect-loop + ge sensorn tid att boota/annonsera)
-    private let postHardResetHoldoffSeconds: TimeInterval = 0.7
     private var lastHardResetAt: [UUID: Date] = [:]
-
-    // Anti-spam: begränsa hur ofta vi försöker connecta (även om många events triggar)
-    private let minConnectAttemptInterval: TimeInterval = 0.8
     private var lastConnectAttemptAt: [UUID: Date] = [:]
 
     // MARK: - Internals
@@ -106,12 +134,18 @@ final class BLECoordinator: NSObject, ObservableObject {
         "savedSensors"
     ]
 
+    private let tuningKey = "BLEHeartRate.BLEGlobalTuning.v1"
+
     private let debugMigrationLogs = false
 
     // MARK: - Init
 
     override init() {
         super.init()
+
+        // Load tuning first (used by tick/connect logic)
+        loadTuning()
+
         central = CBCentralManager(delegate: self, queue: DispatchQueue(label: "ble.central.queue"))
 
         loadConfigsWithAutoDetectMigration()
@@ -126,16 +160,28 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     // MARK: - Public API (Views)
 
-    /// User pressed Scan in SensorsView → enable auto mode and broad scan
+    /// SensorsView "Scan" (broad discover) – also re-enables auto mode
     func userStartScanning() {
         scanMode = .auto
         startScan(scope: .broad)
     }
 
-    /// User pressed Stop in SensorsView → manual override OFF
+    /// SensorsView "Stop" – manual override OFF
     func userStopScanning() {
         scanMode = .manualOff
         stopScan()
+    }
+
+    /// General scan (HR-only) for Dashboard/Coach/etc.
+    func startScan() {
+        scanMode = .auto
+        startScan(scope: .hrOnly)
+    }
+
+    /// Optional helper if you want to trigger broad scan from elsewhere
+    func startBroadScan() {
+        scanMode = .auto
+        startScan(scope: .broad)
     }
 
     /// Auto/Coordinator calls this when it needs to scan (respects manualOff) → HR-only
@@ -147,7 +193,7 @@ final class BLECoordinator: NSObject, ObservableObject {
     private func startScan(scope: ScanScope) {
         guard isPoweredOn else { return }
 
-        // Om vi redan skannar men i "fel scope" → restart scan med nya parametrar
+        // If already scanning but wrong scope → restart with new parameters
         if isScanning, scanScope != scope {
             central.stopScan()
             isScanning = false
@@ -166,7 +212,6 @@ final class BLECoordinator: NSObject, ObservableObject {
             CBCentralManagerScanOptionAllowDuplicatesKey: true
         ]
 
-        // ✅ HR-only scan för auto, broad scan för manuell discover
         switch scope {
         case .hrOnly:
             central.scanForPeripherals(withServices: [hrService], options: opts)
@@ -189,16 +234,18 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     func connect(id: UUID) {
         wantedConnected.insert(id)
-        setState(id: id, state: .connecting, text: "Ansluter…")
+        setState(id: id, state: .connecting, text: "Ansluter…", resetForNewConnection: true)
+
+        let now = Date()
 
         if let p = peripherals[id] {
-            connectPeripheralIfEligible(p, id: id, now: Date(), reason: "manual connect")
+            connectPeripheralIfEligible(p, id: id, now: now, reason: "manual connect")
             return
         }
 
         if let d = discoveredMap[id], let p = d.peripheral {
             peripherals[id] = p
-            connectPeripheralIfEligible(p, id: id, now: Date(), reason: "manual connect from discovered")
+            connectPeripheralIfEligible(p, id: id, now: now, reason: "manual connect from discovered")
             return
         }
 
@@ -211,7 +258,7 @@ final class BLECoordinator: NSObject, ObservableObject {
         if let p = peripherals[id] {
             central.cancelPeripheralConnection(p)
         }
-        setState(id: id, state: .disconnected, text: "Frånkopplad")
+        setState(id: id, state: .disconnected, text: "Frånkopplad", resetForNewConnection: false)
     }
 
     func reconnectAllAuto() {
@@ -280,37 +327,42 @@ final class BLECoordinator: NSObject, ObservableObject {
             if let last = rt.lastHRAt {
                 let delta = Int(now.timeIntervalSince(last))
                 rt.lastSeenSeconds = max(0, delta)
-                rt.isStale = delta > staleSoftSeconds
+                rt.isStale = delta > tuning.staleSoftSeconds
             } else {
+                // Important: if we're connected but haven't received first HR yet,
+                // we keep lastSeenSeconds at 0 to avoid immediate watchdog loops.
                 rt.lastSeenSeconds = 0
                 rt.isStale = false
             }
 
             runtime[id] = rt
 
-            // Hard watchdog: connected men tyst länge → forcera reconnect (pool-case)
-            if rt.state == .connected, rt.lastSeenSeconds >= staleHardResetSeconds {
-                // Respektera holdoff: om vi precis hard-resettat, vänta
-                if let lastHR = lastHardResetAt[id], now.timeIntervalSince(lastHR) < postHardResetHoldoffSeconds {
+            // Hard watchdog: connected but silent for long → force reconnect (pool-case)
+            if rt.state == .connected,
+               rt.lastHRAt != nil,
+               rt.lastSeenSeconds >= tuning.staleHardResetSeconds {
+
+                // Respect holdoff: if we just hard-resettat, wait
+                if isInPostHardResetHoldoff(id: id, now: now) {
                     continue
                 }
 
                 if let p = peripherals[id], p.state == .connected {
                     lastHardResetAt[id] = now
 
-                    // Lägg holdoff även i reconnect-policy så auto-reconnect inte hugger direkt
+                    // Add holdoff to reconnect-policy so auto-reconnect doesn't bite immediately
                     reconnectPolicy[id] = ReconnectPolicy(
                         attemptCount: 0,
-                        nextAllowedAt: now.addingTimeInterval(postHardResetHoldoffSeconds)
+                        nextAllowedAt: now.addingTimeInterval(tuning.postHardResetHoldoffSeconds)
                     )
 
                     central.cancelPeripheralConnection(p)
-                    setState(id: id, state: .disconnected, text: "Signal tappad • reconnect")
+                    setState(id: id, state: .disconnected, text: "Signal tappad • reconnect", resetForNewConnection: false)
                 }
             }
         }
 
-        // Throttlad RSSI
+        // Throttled RSSI
         for (id, p) in peripherals where p.state == .connected {
             readRSSIIfAllowed(id: id, peripheral: p, now: now)
         }
@@ -338,7 +390,7 @@ final class BLECoordinator: NSObject, ObservableObject {
     }
 
     private func readRSSIIfAllowed(id: UUID, peripheral: CBPeripheral, now: Date) {
-        if let last = lastRSSIReadAt[id], now.timeIntervalSince(last) < minRSSIInterval {
+        if let last = lastRSSIReadAt[id], now.timeIntervalSince(last) < tuning.minRSSIInterval {
             return
         }
         lastRSSIReadAt[id] = now
@@ -357,7 +409,7 @@ final class BLECoordinator: NSObject, ObservableObject {
     // MARK: - Reconnect policy
 
     private func attemptReconnect(id: UUID, now: Date) {
-        // Om vi är i post-hard-reset holdoff, gör inget (låter sensorn boota/annonsera)
+        // If we're in post-hard-reset holdoff, do nothing (let device boot/announce)
         if isInPostHardResetHoldoff(id: id, now: now) { return }
 
         var pol = reconnectPolicy[id] ?? ReconnectPolicy()
@@ -365,22 +417,19 @@ final class BLECoordinator: NSObject, ObservableObject {
 
         pol.attemptCount += 1
 
-        // Aggressiv tidigt (pool)
+        let idx = max(1, pol.attemptCount) - 1
+        let ladder = tuning.reconnectDelays
         let delay: TimeInterval
-        switch pol.attemptCount {
-        case 1: delay = 0.0
-        case 2: delay = 0.2
-        case 3: delay = 0.5
-        case 4: delay = 1.0
-        case 5: delay = 1.5
-        default: delay = 2.0
+        if idx < ladder.count {
+            delay = ladder[idx]
+        } else {
+            delay = ladder.last ?? 2.0
         }
 
         pol.nextAllowedAt = now.addingTimeInterval(delay)
         reconnectPolicy[id] = pol
 
         if let p = peripherals[id] {
-            if !canAttemptConnectNow(id: id, peripheral: p, now: now) { return }
             connectPeripheralIfEligible(p, id: id, now: now, reason: "auto reconnect")
         } else {
             startScanIfAllowed()
@@ -395,14 +444,14 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     private func isInPostHardResetHoldoff(id: UUID, now: Date) -> Bool {
         guard let last = lastHardResetAt[id] else { return false }
-        return now.timeIntervalSince(last) < postHardResetHoldoffSeconds
+        return now.timeIntervalSince(last) < tuning.postHardResetHoldoffSeconds
     }
 
     private func canAttemptConnectNow(id: UUID, peripheral: CBPeripheral, now: Date) -> Bool {
         if peripheral.state == .connecting || peripheral.state == .connected { return false }
         if isInPostHardResetHoldoff(id: id, now: now) { return false }
 
-        if let last = lastConnectAttemptAt[id], now.timeIntervalSince(last) < minConnectAttemptInterval {
+        if let last = lastConnectAttemptAt[id], now.timeIntervalSince(last) < tuning.minConnectAttemptInterval {
             return false
         }
         return true
@@ -414,7 +463,7 @@ final class BLECoordinator: NSObject, ObservableObject {
                                              reason: String) {
         guard canAttemptConnectNow(id: id, peripheral: p, now: now) else { return }
 
-        // Registrera connect-försök direkt (anti-spam)
+        // Register connect attempt immediately (anti-spam)
         lastConnectAttemptAt[id] = now
 
         connectPeripheral(p, reason: reason)
@@ -448,6 +497,22 @@ final class BLECoordinator: NSObject, ObservableObject {
         if anyMissing {
             startScanIfAllowed()
         }
+    }
+
+    // MARK: - Persistence (Tuning)
+
+    private func loadTuning() {
+        guard let data = UserDefaults.standard.data(forKey: tuningKey),
+              let decoded = try? JSONDecoder().decode(BLEGlobalTuning.self, from: data) else {
+            tuning = .default
+            return
+        }
+        tuning = decoded
+    }
+
+    private func saveTuning() {
+        guard let data = try? JSONEncoder().encode(tuning) else { return }
+        UserDefaults.standard.set(data, forKey: tuningKey)
     }
 
     // MARK: - Persistence (AUTO-DETECT + MIGRATION)
@@ -500,12 +565,8 @@ final class BLECoordinator: NSObject, ObservableObject {
     }
 
     private func saveConfigs() {
-        do {
-            let data = try JSONEncoder().encode(sensorConfigs)
-            UserDefaults.standard.set(data, forKey: configsKey)
-        } catch {
-            // ignore
-        }
+        guard let data = try? JSONEncoder().encode(sensorConfigs) else { return }
+        UserDefaults.standard.set(data, forKey: configsKey)
     }
 
     private func ensureRuntimeEntries() {
@@ -518,12 +579,28 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     // MARK: - Helpers
 
-    private func setState(id: UUID, state: ConnectionState, text: String) {
+    private func setState(id: UUID,
+                          state: ConnectionState,
+                          text: String,
+                          resetForNewConnection: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             var rt = self.runtime[id] ?? SensorRuntime()
             rt.state = state
             rt.statusText = text
+
+            if resetForNewConnection {
+                // Key fix: avoid watchdog loop after range-loss/reconnect.
+                rt.lastHRAt = nil
+                rt.lastSeenSeconds = 0
+                rt.isStale = false
+            }
+
+            if state == .connected {
+                rt.lastSeenSeconds = 0
+                rt.isStale = false
+            }
+
             self.runtime[id] = rt
         }
     }
@@ -556,14 +633,12 @@ final class BLECoordinator: NSObject, ObservableObject {
             let now = Date()
             var rt = self.runtime[id] ?? SensorRuntime()
 
-            // Always update live values
             rt.hr = hr
             rt.rrMs = rrMs
             rt.lastHRAt = now
             rt.isStale = false
             rt.percentOfMax = percent
 
-            // Rate-limit graph samples to 1Hz
             let lastSample = self.historyLastSampleAt[id]
             let canAppend = (lastSample == nil) || (now.timeIntervalSince(lastSample!) >= self.historySamplePeriod)
 
@@ -571,7 +646,6 @@ final class BLECoordinator: NSObject, ObservableObject {
                 self.historyLastSampleAt[id] = now
                 rt.percentHistory.append(percent)
 
-                // Keep up to 2 hours @ 1Hz
                 if rt.percentHistory.count > self.historyMaxSamples {
                     rt.percentHistory.removeFirst(rt.percentHistory.count - self.historyMaxSamples)
                 }
@@ -583,7 +657,7 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     private func connectPeripheral(_ p: CBPeripheral, reason: String) {
         p.delegate = self
-        setState(id: p.identifier, state: .connecting, text: "Ansluter…")
+        setState(id: p.identifier, state: .connecting, text: "Ansluter…", resetForNewConnection: true)
 
         central.connect(p, options: [
             CBConnectPeripheralOptionNotifyOnDisconnectionKey: true
@@ -650,7 +724,6 @@ extension BLECoordinator: CBCentralManagerDelegate {
                         advertisementData: [String : Any],
                         rssi RSSI: NSNumber) {
 
-        // Broad scan kan hitta "allt" → filtrera bort icke-connectable om flaggan finns
         if let connectable = advertisementData[CBAdvertisementDataIsConnectable] as? Bool, connectable == false {
             return
         }
@@ -675,34 +748,24 @@ extension BLECoordinator: CBCentralManagerDelegate {
 
         if sensorConfigs.contains(where: { $0.id == id }) {
             if (runtime[id]?.state ?? .disconnected) == .disconnected {
-                setState(id: id, state: .scanning, text: "Hittad • redo")
+                setState(id: id, state: .scanning, text: "Hittad • redo", resetForNewConnection: false)
             }
         }
 
         let shouldWant = wantedConnected.contains(id) || sensorConfigs.first(where: { $0.id == id })?.autoConnect == true
         if shouldWant {
             let now = Date()
-            let rt = runtime[id] ?? SensorRuntime()
-
-            // Prioritera om den är disconnected eller stale (typ “kom upp ur vatten”)
-            let needsPriority = (rt.state == .disconnected) || rt.isStale || (rt.lastHRAt == nil)
-
-            if needsPriority {
-                connectPeripheralIfEligible(peripheral, id: id, now: now, reason: "discovered priority reconnect")
-            } else {
-                connectPeripheralIfEligible(peripheral, id: id, now: now, reason: "discovered wanted")
-            }
+            connectPeripheralIfEligible(peripheral, id: id, now: now, reason: "discovered wanted")
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         resetReconnectPolicy(id: peripheral.identifier)
-        setState(id: peripheral.identifier, state: .connected, text: "Ansluten")
+        setState(id: peripheral.identifier, state: .connected, text: "Ansluten", resetForNewConnection: true)
 
         peripheral.delegate = self
         peripheral.discoverServices([hrService, batteryService])
 
-        // OK att läsa RSSI direkt vid connect
         lastRSSIReadAt[peripheral.identifier] = Date()
         peripheral.readRSSI()
     }
@@ -710,13 +773,13 @@ extension BLECoordinator: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
-        setState(id: peripheral.identifier, state: .disconnected, text: "Misslyckades")
+        setState(id: peripheral.identifier, state: .disconnected, text: "Misslyckades", resetForNewConnection: false)
     }
 
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        setState(id: peripheral.identifier, state: .disconnected, text: "Frånkopplad")
+        setState(id: peripheral.identifier, state: .disconnected, text: "Frånkopplad", resetForNewConnection: false)
     }
 }
 
@@ -770,7 +833,6 @@ extension BLECoordinator: CBPeripheralDelegate {
         if characteristic.uuid == hrMeasurementChar {
             let parsed = parseHeartRateMeasurement(data)
             updateHR(id: peripheral.identifier, hr: parsed.hr, rrMs: parsed.rrMs)
-            // ✅ inte readRSSI här
             return
         }
 
