@@ -1,4 +1,4 @@
-// Version 1.0.11
+// Version 1.0.12
 import SwiftUI
 
 struct DashboardView: View {
@@ -6,9 +6,9 @@ struct DashboardView: View {
 
     var body: some View {
         GeometryReader { geo in
-            // ✅ Filtrera bort dolda sensorer
             let visibleConfigs: [SensorConfig] = ble.sensorConfigs.filter { $0.showOnDashboard }
             let runtimes: [UUID: SensorRuntime] = ble.runtime
+
             let visibleCount = visibleConfigs.count
             let totalCount = ble.sensorConfigs.count
 
@@ -69,7 +69,7 @@ struct DashboardView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("HR Monitor")
             .toolbar { toolbarContent }
-            // ✅ minimera “flicker” vid många uppdateringar
+            // ✅ minimera “flicker” vid många runtime-uppdateringar
             .transaction { tx in tx.animation = nil }
         }
     }
@@ -132,11 +132,15 @@ struct DashboardView: View {
                             isWide: Bool) -> some View {
         let spacing: CGFloat = 14
 
+        // ✅ Viktigt: när 3–4 sensorer (2x2) måste korten bli "compact" för att få plats
+        // Även 2 sensorer på smal skärm (iPhone portrait) blir bättre som compact.
+        let useCompactForFill: Bool = (configs.count >= 3) || (!isWide && configs.count == 2)
+
         switch configs.count {
         case 1:
             let cfg = configs[0]
             let rt = runtimes[cfg.id] ?? SensorRuntime()
-            SensorCard(cfg: cfg, rt: rt, compact: false)
+            SensorCard(cfg: cfg, rt: rt, compact: false) // 1 sensor: stort kort
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal)
                 .padding(.bottom, 18)
@@ -148,16 +152,16 @@ struct DashboardView: View {
             Group {
                 if isWide {
                     HStack(spacing: spacing) {
-                        SensorCard(cfg: c0, rt: r0, compact: false)
+                        SensorCard(cfg: c0, rt: r0, compact: useCompactForFill)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        SensorCard(cfg: c1, rt: r1, compact: false)
+                        SensorCard(cfg: c1, rt: r1, compact: useCompactForFill)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 } else {
                     VStack(spacing: spacing) {
-                        SensorCard(cfg: c0, rt: r0, compact: false)
+                        SensorCard(cfg: c0, rt: r0, compact: useCompactForFill)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        SensorCard(cfg: c1, rt: r1, compact: false)
+                        SensorCard(cfg: c1, rt: r1, compact: useCompactForFill)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
@@ -173,7 +177,7 @@ struct DashboardView: View {
                 HStack(spacing: spacing) {
                     ForEach(top) { cfg in
                         let rt = runtimes[cfg.id] ?? SensorRuntime()
-                        SensorCard(cfg: cfg, rt: rt, compact: false)
+                        SensorCard(cfg: cfg, rt: rt, compact: true) // ✅ alltid compact i 2x2
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
@@ -186,7 +190,7 @@ struct DashboardView: View {
                     } else {
                         ForEach(bottom) { cfg in
                             let rt = runtimes[cfg.id] ?? SensorRuntime()
-                            SensorCard(cfg: cfg, rt: rt, compact: false)
+                            SensorCard(cfg: cfg, rt: rt, compact: true) // ✅ alltid compact i 2x2
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                         if bottom.count == 1 {
@@ -225,15 +229,16 @@ private struct SensorCard: View {
         let zone = rt.percentOfMax.map { HRZone.from(percent: $0) }
 
         let hrFont: Font = compact
-            ? .system(size: 52, weight: .bold, design: .rounded)
+            ? .system(size: 46, weight: .bold, design: .rounded)
             : .system(size: 84, weight: .bold, design: .rounded)
 
-        let sparkHeight: CGFloat = compact ? 46 : 90
+        // ✅ större sparkline, men inte så stor att 2x2 spricker
+        let sparkHeight: CGFloat = compact ? 64 : 120
 
-        VStack(alignment: .leading, spacing: compact ? 12 : 16) {
+        VStack(alignment: .leading, spacing: compact ? 10 : 16) {
             HStack(alignment: .top) {
                 Text(cfg.avatar)
-                    .font(.system(size: compact ? 34 : 46))
+                    .font(.system(size: compact ? 30 : 46))
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(cfg.displayName)
@@ -267,16 +272,16 @@ private struct SensorCard: View {
                 Text(bpmText).font(hrFont)
 
                 Text("bpm")
-                    .font(compact ? .headline : .title3)
+                    .font(compact ? .subheadline : .title3)
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(pctText)
-                        .font(compact ? .headline : .title3.weight(.semibold))
+                        .font(compact ? .subheadline.weight(.semibold) : .title3.weight(.semibold))
                     Text("av max \(cfg.maxHR)")
-                        .font(compact ? .caption : .subheadline)
+                        .font(compact ? .caption2 : .subheadline)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -313,7 +318,7 @@ private struct SensorCard: View {
                     .frame(height: 10)
             }
         }
-        .padding(compact ? 16 : 22)
+        .padding(compact ? 14 : 22)
         .background(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
                 .fill(.ultraThinMaterial)
