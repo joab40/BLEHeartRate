@@ -1,4 +1,4 @@
-// Version 1.0.15
+// Version 1.0.18
 import Foundation
 import Combine
 import CoreBluetooth
@@ -32,6 +32,12 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     private let batteryService = CBUUID(string: "180F")
     private let batteryLevelChar = CBUUID(string: "2A19")
+
+    // MARK: - History policy (2h + 1Hz for graph)
+
+    private let historySamplePeriod: TimeInterval = 1.0       // max 1 punkt/sek i grafen
+    private let historyMaxSamples: Int = 2 * 60 * 60          // 2h @ 1Hz
+    private var historyLastSampleAt: [UUID: Date] = [:]       // per sensor
 
     // MARK: - Internals
 
@@ -166,6 +172,10 @@ final class BLECoordinator: NSObject, ObservableObject {
 
         runtime.removeValue(forKey: id)
         discoveredMap.removeValue(forKey: id)
+        peripherals.removeValue(forKey: id)
+        reconnectPolicy.removeValue(forKey: id)
+        historyLastSampleAt.removeValue(forKey: id)
+
         refreshDiscoveredPublished()
     }
 
@@ -234,14 +244,12 @@ final class BLECoordinator: NSObject, ObservableObject {
 
             if rt.state == .disconnected {
                 attemptReconnect(id: id, now: now)
-                // If we don't have a peripheral handle yet, scanning may be needed
                 if peripherals[id] == nil {
                     anyAutoNeedsHelp = true
                 }
             }
         }
 
-        // If we have auto sensors that need help and scanning is allowed -> scan
         if anyAutoNeedsHelp && scanMode == .auto && isPoweredOn && !isScanning {
             startScan()
         }
@@ -252,7 +260,7 @@ final class BLECoordinator: NSObject, ObservableObject {
     private func percentOfMaxStable(hr: Int, maxHR: Int) -> Int {
         guard maxHR > 0 else { return 0 }
         let raw = (Double(hr) * 100.0) / Double(maxHR)
-        let p = Int(raw) // trunc/floor
+        let p = Int(raw)
         return max(0, min(100, p))
     }
 
@@ -279,7 +287,6 @@ final class BLECoordinator: NSObject, ObservableObject {
         if let p = peripherals[id] {
             connectPeripheral(p, reason: "auto reconnect")
         } else {
-            // No peripheral handle -> scan if allowed
             startScanIfAllowed()
         }
     }
@@ -295,26 +302,22 @@ final class BLECoordinator: NSObject, ObservableObject {
         let ids = sensorConfigs.map(\.id)
         guard !ids.isEmpty else { return }
 
-        // Retrieve previously known peripherals by identifier (fast path)
         let retrieved = central.retrievePeripherals(withIdentifiers: ids)
         for p in retrieved {
             peripherals[p.identifier] = p
         }
 
-        // Also retrieve currently connected peripherals that expose HR service
         let connected = central.retrieveConnectedPeripherals(withServices: [hrService])
         for p in connected {
             peripherals[p.identifier] = p
         }
 
-        // Connect those that should auto-connect
         for cfg in sensorConfigs where cfg.autoConnect {
             if let p = peripherals[cfg.id] {
                 connectPeripheral(p, reason: "bootstrap autoConnect")
             }
         }
 
-        // If still missing some auto sensors -> scan (unless user turned it off)
         let anyMissing = sensorConfigs.contains { $0.autoConnect && peripherals[$0.id] == nil }
         if anyMissing {
             startScanIfAllowed()
@@ -423,16 +426,29 @@ final class BLECoordinator: NSObject, ObservableObject {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+
+            let now = Date()
             var rt = self.runtime[id] ?? SensorRuntime()
+
+            // Always update “live” values
             rt.hr = hr
             rt.rrMs = rrMs
-            rt.lastHRAt = Date()
+            rt.lastHRAt = now
             rt.isStale = false
             rt.percentOfMax = percent
 
-            rt.percentHistory.append(percent)
-            if rt.percentHistory.count > 120 {
-                rt.percentHistory.removeFirst(rt.percentHistory.count - 120)
+            // ✅ Rate-limit graph samples to 1Hz
+            let lastSample = self.historyLastSampleAt[id]
+            let canAppend = (lastSample == nil) || (now.timeIntervalSince(lastSample!) >= self.historySamplePeriod)
+
+            if canAppend {
+                self.historyLastSampleAt[id] = now
+                rt.percentHistory.append(percent)
+
+                // ✅ Keep up to 2 hours @ 1Hz
+                if rt.percentHistory.count > self.historyMaxSamples {
+                    rt.percentHistory.removeFirst(rt.percentHistory.count - self.historyMaxSamples)
+                }
             }
 
             self.runtime[id] = rt
@@ -497,7 +513,6 @@ extension BLECoordinator: CBCentralManagerDelegate {
         }
 
         if powered {
-            // ✅ Best practice: retrieve known peripherals then connect / scan if needed
             bootstrapKnownPeripheralsAndConnectAuto()
         } else {
             stopScan()

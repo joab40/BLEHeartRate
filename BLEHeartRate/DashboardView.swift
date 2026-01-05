@@ -1,4 +1,4 @@
-// Version 1.0.17
+// Version 1.0.18
 import SwiftUI
 
 struct DashboardView: View {
@@ -79,6 +79,7 @@ struct DashboardView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
+                // Endast vänstersidan visar status (t.ex. "Skannar…") via ble.bluetoothText
                 Label(ble.bluetoothText, systemImage: ble.isPoweredOn ? "bolt.heart" : "bolt.slash")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -253,6 +254,7 @@ private struct SensorCard: View {
             : .system(size: 84, weight: .bold, design: .rounded)
 
         let sparkHeight: CGFloat = compact ? 64 : 120
+        let sparkTargetPoints: Int = compact ? 220 : 320
 
         VStack(alignment: .leading, spacing: compact ? 10 : 16) {
             HStack(alignment: .top) {
@@ -315,9 +317,32 @@ private struct SensorCard: View {
                 }
             }
 
-            SparklineView(values: rt.percentHistory)
-                .frame(height: sparkHeight)
-                .opacity(rt.percentHistory.isEmpty ? 0.55 : 1.0)
+            // ✅ Sparkline med "Span" + "Senast" overlay
+            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                let now = context.date
+
+                let spanSeconds: Int? = approximateSpanSeconds(samplePeriodSeconds: 1)
+                let lastAgeSeconds: Int? = rt.lastHRAt.map { max(0, Int(now.timeIntervalSince($0))) }
+
+                let spanText = spanSeconds.map { "Span: \(formatSpan(seconds: $0))" } ?? "Span: —"
+                let lastText = lastAgeSeconds.map { "Senast: \(formatSpan(seconds: $0))" } ?? "Senast: —"
+
+                ZStack(alignment: .bottom) {
+                    SparklineView(values: downsample(rt.percentHistory, target: sparkTargetPoints))
+                        .frame(height: sparkHeight)
+                        .opacity(rt.percentHistory.isEmpty ? 0.55 : 1.0)
+
+                    HStack {
+                        Text(spanText)
+                        Spacer()
+                        Text(lastText)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+                }
+            }
 
             Spacer(minLength: compact ? 0 : 8)
 
@@ -384,6 +409,40 @@ private struct SensorCard: View {
         case .disconnected:
             return "Frånkopplad"
         }
+    }
+
+    // MARK: Helpers (Sparkline)
+
+    /// Antar att du loggar 1 punkt per sekund (rate-limitad i coordinator).
+    private func approximateSpanSeconds(samplePeriodSeconds: Int) -> Int? {
+        let n = rt.percentHistory.count
+        guard n >= 2 else { return n == 1 ? 0 : nil }
+        return (n - 1) * max(1, samplePeriodSeconds)
+    }
+
+    private func downsample(_ values: [Int], target: Int) -> [Int] {
+        guard target > 0, values.count > target else { return values }
+        let step = Double(values.count - 1) / Double(target - 1)
+
+        var out: [Int] = []
+        out.reserveCapacity(target)
+
+        for i in 0..<target {
+            let idx = Int(round(Double(i) * step))
+            if idx >= 0 && idx < values.count {
+                out.append(values[idx])
+            }
+        }
+        return out
+    }
+
+    private func formatSpan(seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        let m = seconds / 60
+        if m < 60 { return "\(m)m" }
+        let h = m / 60
+        let mm = m % 60
+        return "\(h)h \(mm)m"
     }
 }
 
