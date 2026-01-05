@@ -1,20 +1,17 @@
-// Tag 1.0.23
-// NOTE (Scan strategy / why these wrappers are used):
-// - ContentView (och CoachModeView) anropar INTE BLECoordinator.startScan(...) direkt.
-//   Orsak: startScan kan vara private och/eller kräva extra parametrar (t.ex. scope),
-//   vilket annars ger byggfel när API:t ändras.
-// - I stället används de publika wrapper-metoderna:
-//     • ble.userStartScanning()  -> sätter scanMode = .auto och startar scanning
-//     • ble.userStopScanning()   -> sätter scanMode = .manualOff och stoppar scanning
-//   Detta gör UI:t stabilt över tid, samtidigt som användaren kan slå av/på scanning manuellt.
-// - reconnectAllAuto() finns kvar för att snabbt försöka återansluta sparade sensorer (coach-läge/poolkant).
+// ContentView.swift
+// Version 1.0.24
+// NOTE (UI strategy):
+// - Inga views ska kalla ble.startScan()/stopScan direkt, eftersom BLECoordinator kan ha dem som private
+//   eller ha startScan(scope:) i vissa versioner.
+// - Vi använder ENBART ble.userStartScanning() / ble.userStopScanning() från UI.
+// - Zon/fart (F1–F5) kommer från HRZone i SensorModels.swift.
 
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var ble = BLECoordinator()
 
-    // Coach Mode (sparas lokalt)
     @AppStorage("coachModeEnabled") private var coachModeEnabled: Bool = false
 
     var body: some View {
@@ -43,7 +40,6 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            // Poolkant: håll skärmen vaken
             UIApplication.shared.isIdleTimerDisabled = true
         }
         .onDisappear {
@@ -52,13 +48,10 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Coach Mode View
-
 private struct CoachModeView: View {
     @EnvironmentObject private var ble: BLECoordinator
     @Binding var coachModeEnabled: Bool
 
-    // Enkel pagination om du har flera sensorer
     @State private var index: Int = 0
 
     var body: some View {
@@ -86,23 +79,19 @@ private struct CoachModeView: View {
                 }
                 .padding()
             } else {
-                // Se till att index är inom range
                 let safeIndex = min(max(index, 0), configs.count - 1)
                 let cfg = configs[safeIndex]
                 let rt = runtimes[cfg.id] ?? SensorRuntime()
 
                 VStack(spacing: 18) {
                     topBar(cfg: cfg, rt: rt, count: configs.count)
-
                     bigNumbers(cfg: cfg, rt: rt)
 
-                    // stor sparkline
                     SparklineView(values: rt.percentHistory)
                         .frame(height: 120)
                         .padding(.horizontal)
                         .opacity(rt.percentHistory.isEmpty ? 0.5 : 1.0)
 
-                    // zon-bar extra tydlig
                     if let pct = rt.percentOfMax {
                         ZonePill(percent: pct, isStale: rt.isStale)
                             .padding(.horizontal)
@@ -122,12 +111,9 @@ private struct CoachModeView: View {
             }
         }
         .onAppear {
-            // Coach Mode: ofta vill man att den reconnectar allt auto direkt
             ble.reconnectAllAuto()
         }
     }
-
-    // MARK: UI blocks
 
     private func topBar(cfg: SensorConfig, rt: SensorRuntime, count: Int) -> some View {
         HStack {
@@ -149,14 +135,8 @@ private struct CoachModeView: View {
             Spacer()
 
             VStack(alignment: .trailing, spacing: 6) {
-                if let b = rt.battery {
-                    Text("🔋 \(b)%")
-                        .foregroundStyle(.white.opacity(0.85))
-                }
-                if let rssi = rt.rssi {
-                    Text("\(rssi) dBm")
-                        .foregroundStyle(.white.opacity(0.75))
-                }
+                if let b = rt.battery { Text("🔋 \(b)%").foregroundStyle(.white.opacity(0.85)) }
+                if let rssi = rt.rssi { Text("\(rssi) dBm").foregroundStyle(.white.opacity(0.75)) }
                 Text("\(index + 1)/\(count)")
                     .foregroundStyle(.white.opacity(0.6))
                     .font(.caption)
@@ -203,36 +183,26 @@ private struct CoachModeView: View {
     private func bottomControls(count: Int) -> some View {
         VStack(spacing: 12) {
             HStack(spacing: 12) {
-                Button {
-                    ble.reconnectAllAuto()
-                } label: {
+                Button { ble.reconnectAllAuto() } label: {
                     Label("Reconnect", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(.borderedProminent)
 
                 if ble.isScanning {
-                    Button {
-                        // ✅ wrapper (manual OFF) – se note längst upp
-                        ble.userStopScanning()
-                    } label: {
+                    Button { ble.userStopScanning() } label: {
                         Label("Stop Scan", systemImage: "stop.circle")
                     }
                     .buttonStyle(.bordered)
                     .tint(.white.opacity(0.85))
                 } else {
-                    Button {
-                        // ✅ wrapper (auto ON) – se note längst upp
-                        ble.userStartScanning()
-                    } label: {
+                    Button { ble.userStartScanning() } label: {
                         Label("Scan", systemImage: "magnifyingglass")
                     }
                     .buttonStyle(.bordered)
                     .tint(.white.opacity(0.85))
                 }
 
-                Button {
-                    coachModeEnabled = false
-                } label: {
+                Button { coachModeEnabled = false } label: {
                     Label("Exit", systemImage: "xmark.circle")
                 }
                 .buttonStyle(.bordered)
@@ -241,17 +211,13 @@ private struct CoachModeView: View {
 
             if count > 1 {
                 HStack(spacing: 12) {
-                    Button {
-                        index = max(0, index - 1)
-                    } label: {
+                    Button { index = max(0, index - 1) } label: {
                         Label("Prev", systemImage: "chevron.left")
                     }
                     .buttonStyle(.bordered)
                     .tint(.white.opacity(0.85))
 
-                    Button {
-                        index = min(count - 1, index + 1)
-                    } label: {
+                    Button { index = min(count - 1, index + 1) } label: {
                         Label("Next", systemImage: "chevron.right")
                     }
                     .buttonStyle(.bordered)
@@ -264,19 +230,17 @@ private struct CoachModeView: View {
 
     private func statusLine(_ rt: SensorRuntime) -> String {
         switch rt.state {
-        case ConnectionState.connected:
+        case .connected:
             return rt.isStale ? "Ansluten • Signal tappad (under vatten?)" : "Ansluten • OK"
-        case ConnectionState.connecting:
+        case .connecting:
             return "Ansluter…"
-        case ConnectionState.scanning:
+        case .scanning:
             return "Skannar…"
-        case ConnectionState.disconnected:
+        case .disconnected:
             return "Frånkopplad"
         }
     }
 }
-
-// MARK: - Zone pill
 
 private struct ZonePill: View {
     let percent: Int
@@ -286,7 +250,7 @@ private struct ZonePill: View {
         let zone = HRZone.from(percent: percent)
 
         return HStack {
-            Text("Zon \(zoneLabel(zone))")
+            Text("\(zone.shortLabel) • \(zone.name)")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.black.opacity(0.9))
 
@@ -306,27 +270,7 @@ private struct ZonePill: View {
         .frame(height: 56)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(zoneColor(zone).opacity(isStale ? 0.5 : 0.95))
+                .fill(zone.color.opacity(isStale ? 0.5 : 0.95))
         )
-    }
-
-    private func zoneLabel(_ z: HRZone) -> String {
-        switch z {
-        case .z1: return "1"
-        case .z2: return "2"
-        case .z3: return "3"
-        case .z4: return "4"
-        case .z5: return "5"
-        }
-    }
-
-    private func zoneColor(_ z: HRZone) -> Color {
-        switch z {
-        case .z1: return .blue
-        case .z2: return .green
-        case .z3: return .yellow
-        case .z4: return .orange
-        case .z5: return .red
-        }
     }
 }

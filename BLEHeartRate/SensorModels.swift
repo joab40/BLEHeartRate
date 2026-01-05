@@ -1,70 +1,51 @@
-// Version 1.0.16
+// SensorModels.swift
+// Version 1.0.24
+// NOTE (Zones/Fart strategy):
+// - HRZone är din “zon/fart”-källa för hela appen.
+// - Gränser (% av sim-HRmax):
+//   F1: 0–60   (återhämtning/badning; “snacktempo”)
+//   F2: 61–75  (aerob bas)
+//   F3: 76–85  (tröskel/CSS)
+//   F4: 86–93  (anaerob tröskel / mjölksyratålighet)
+//   F5: 94–100 (sprint/VO₂; puls trubbigt vid korta sprintar — fart/RPE/paus styr bättre)
+//
+// NOTE (Implementation):
+// - UI visar F1–F5 via HRZone.shortLabel/name.
+// - Om du vill ändra zoner i framtiden: gör det här (HRZone.from).
+
 import Foundation
 import SwiftUI
 
 enum ConnectionState: String, Codable {
-    case disconnected
-    case scanning
-    case connecting
     case connected
+    case connecting
+    case scanning
+    case disconnected
 }
 
 struct SensorConfig: Identifiable, Codable, Equatable {
-    let id: UUID                 // CBPeripheral.identifier
+    var id: UUID
     var displayName: String
-    var avatar: String           // emoji
-    var maxHR: Int               // 60...230
+    var avatar: String
+    var maxHR: Int
     var autoConnect: Bool
-
-    // ✅ kan döljas från dashboard
-    var showOnDashboard: Bool = true
+    var showOnDashboard: Bool
 
     static func `default`(id: UUID, name: String) -> SensorConfig {
         SensorConfig(
             id: id,
-            displayName: name.isEmpty ? "Sensor" : name,
-            avatar: "🫀",
+            displayName: name,
+            avatar: "❤️",
             maxHR: 190,
             autoConnect: true,
             showOnDashboard: true
         )
     }
-
-    // ✅ Backward compatible decoding
-    enum CodingKeys: String, CodingKey {
-        case id, displayName, avatar, maxHR, autoConnect, showOnDashboard
-    }
-
-    init(id: UUID,
-         displayName: String,
-         avatar: String,
-         maxHR: Int,
-         autoConnect: Bool,
-         showOnDashboard: Bool = true) {
-        self.id = id
-        self.displayName = displayName
-        self.avatar = avatar
-        self.maxHR = maxHR
-        self.autoConnect = autoConnect
-        self.showOnDashboard = showOnDashboard
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(UUID.self, forKey: .id)
-        displayName = try c.decode(String.self, forKey: .displayName)
-        avatar = try c.decode(String.self, forKey: .avatar)
-        maxHR = try c.decode(Int.self, forKey: .maxHR)
-        autoConnect = try c.decode(Bool.self, forKey: .autoConnect)
-
-        // ✅ Gamla sparade configar saknar denna → default true
-        showOnDashboard = try c.decodeIfPresent(Bool.self, forKey: .showOnDashboard) ?? true
-    }
 }
 
 struct SensorRuntime: Equatable {
     var state: ConnectionState = .disconnected
-    var statusText: String = "Frånkopplad"
+    var statusText: String = ""
 
     var hr: Int? = nil
     var rrMs: Int? = nil
@@ -73,71 +54,55 @@ struct SensorRuntime: Equatable {
 
     var lastHRAt: Date? = nil
     var lastSeenSeconds: Int = 0
-
     var isStale: Bool = false
-    var percentOfMax: Int? = nil
 
-    // historik för sparkline (% av max)
+    var percentOfMax: Int? = nil
     var percentHistory: [Int] = []
+
+    init() {}
 }
 
-enum HRZone: CaseIterable {
+enum HRZone: Equatable {
     case z1, z2, z3, z4, z5
 
-    /// Standardzoner baserat på % av maxpuls
     static func from(percent: Int) -> HRZone {
         let p = max(0, min(100, percent))
         switch p {
-        case ..<60: return .z1
-        case 60..<70: return .z2
-        case 70..<80: return .z3
-        case 80..<90: return .z4
-        default: return .z5
+        case ..<61:  return .z1       // F1: 0–60
+        case 61..<76: return .z2      // F2: 61–75
+        case 76..<86: return .z3      // F3: 76–85
+        case 86..<94: return .z4      // F4: 86–93
+        default:      return .z5      // F5: 94–100
         }
     }
-
-    // MARK: - Presentation
 
     var shortLabel: String {
         switch self {
-        case .z1: return "Z1"
-        case .z2: return "Z2"
-        case .z3: return "Z3"
-        case .z4: return "Z4"
-        case .z5: return "Z5"
+        case .z1: return "F1"
+        case .z2: return "F2"
+        case .z3: return "F3"
+        case .z4: return "F4"
+        case .z5: return "F5"
         }
     }
 
-    /// Zon-namn anpassade för simning (Z2 kondition, Z3 tröskel)
     var name: String {
         switch self {
-        case .z1: return "Lugn"
-        case .z2: return "Kondition"
-        case .z3: return "Tröskel"
-        case .z4: return "Hårt"
-        case .z5: return "Max"
+        case .z1: return "Återhämtning"
+        case .z2: return "Aerob bas"
+        case .z3: return "Tröskel/CSS"
+        case .z4: return "Anaerob tröskel"
+        case .z5: return "Sprint/VO₂"
         }
     }
 
-    /// Färger som är snygga i både light/dark och inte “skrikiga”.
-    /// (Vi använder sen opacity i UI för bakgrund/ram.)
     var color: Color {
         switch self {
-        case .z1: return .cyan
+        case .z1: return .blue
         case .z2: return .green
         case .z3: return .yellow
         case .z4: return .orange
-        case .z5: return .pink
+        case .z5: return .red
         }
-    }
-}
-
-// MARK: - Convenience helpers (optional but nice)
-
-extension SensorRuntime {
-    /// Beräknar zon från percentOfMax om det finns.
-    var zone: HRZone? {
-        guard let p = percentOfMax else { return nil }
-        return HRZone.from(percent: p)
     }
 }

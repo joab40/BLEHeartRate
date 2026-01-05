@@ -1,8 +1,9 @@
-// Version 1.0.23
-// NOTE (Scan-strategy):
-// - Dashboard ska inte anropa BLECoordinator.startScan()/stopScan() direkt (de kan vara private eller kräva extra parametrar).
-// - Använd alltid de publika wrappers: userStartScanning() / userStopScanning().
-//   Dessa respekterar scanMode (auto vs manualOff) och håller logiken samlad i BLECoordinator.
+// DashboardView.swift
+// Version 1.0.24
+// NOTE (Scan integration):
+// - Dashboard använder ble.userStartScanning()/ble.userStopScanning() i toolbar,
+//   så vi är kompatibla även om BLECoordinator har gjort startScan private eller lagt till scope-parameter.
+// - Zon/fart-strategi kommer från HRZone i SensorModels.swift (F1–F5 gränserna).
 
 import SwiftUI
 
@@ -79,12 +80,9 @@ struct DashboardView: View {
         }
     }
 
-    // MARK: Header + Toolbar
-
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                // Endast vänstersidan visar status (t.ex. "Skannar…") via ble.bluetoothText
                 Label(ble.bluetoothText, systemImage: ble.isPoweredOn ? "bolt.heart" : "bolt.slash")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -101,7 +99,6 @@ struct DashboardView: View {
                 Label("Reconnect all", systemImage: "arrow.clockwise")
             }
 
-            // ✅ FIX: Använd publika wrappers (respekterar scanMode + ingen "scope"-param)
             if ble.isScanning {
                 Button { ble.userStopScanning() } label: {
                     Label("Stop", systemImage: "stop.circle")
@@ -113,8 +110,6 @@ struct DashboardView: View {
             }
         }
     }
-
-    // MARK: Fill-layout (1–4)
 
     @ViewBuilder
     private func fillLayout(configs: [SensorConfig],
@@ -172,8 +167,7 @@ struct DashboardView: View {
 
                 HStack(spacing: spacing) {
                     if bottom.isEmpty {
-                        Color.clear
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         ForEach(bottom) { cfg in
                             let rt = runtimes[cfg.id] ?? SensorRuntime()
@@ -181,8 +175,7 @@ struct DashboardView: View {
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                         if bottom.count == 1 {
-                            Color.clear
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                     }
                 }
@@ -195,8 +188,6 @@ struct DashboardView: View {
             EmptyView()
         }
     }
-
-    // MARK: Optimized cols for 5+
 
     private func optimizedGridCols(width: CGFloat, count: Int) -> Int {
         let maxCols: Int
@@ -211,11 +202,7 @@ struct DashboardView: View {
             let rem = count % cols
 
             let orphanPenalty: Double = (rem == 1) ? 100.0 : 0.0
-
-            let unevenPenalty: Double
-            if rem == 0 { unevenPenalty = 0.0 }
-            else if rem == 1 { unevenPenalty = 0.0 }
-            else { unevenPenalty = 4.0 }
+            let unevenPenalty: Double = (rem == 0 || rem == 1) ? 0.0 : 4.0
 
             let sizeBonus: Double = -Double(cols) * 3.0
             let rowPenalty: Double = Double(rows) * 1.5
@@ -237,8 +224,6 @@ struct DashboardView: View {
         return best
     }
 }
-
-// MARK: - Sensor card
 
 private struct SensorCard: View {
     let cfg: SensorConfig
@@ -322,7 +307,6 @@ private struct SensorCard: View {
                 }
             }
 
-            // Sparkline med "Span" + "Senast" RAD ovanför grafen (inte overlay på grafytan)
             TimelineView(.periodic(from: .now, by: 1.0)) { context in
                 let now = context.date
 
@@ -404,20 +388,13 @@ private struct SensorCard: View {
 
     private var statusLine: String {
         switch rt.state {
-        case .connected:
-            return rt.isStale ? "Ansluten • Signal tappad" : "Ansluten • OK"
-        case .connecting:
-            return "Ansluter…"
-        case .scanning:
-            return "Skannar…"
-        case .disconnected:
-            return "Frånkopplad"
+        case .connected:   return rt.isStale ? "Ansluten • Signal tappad" : "Ansluten • OK"
+        case .connecting:  return "Ansluter…"
+        case .scanning:    return "Skannar…"
+        case .disconnected:return "Frånkopplad"
         }
     }
 
-    // MARK: Helpers (Sparkline)
-
-    /// Antar att du loggar 1 punkt per sekund (rate-limitad i coordinator).
     private func approximateSpanSeconds(samplePeriodSeconds: Int) -> Int? {
         let n = rt.percentHistory.count
         guard n >= 2 else { return n == 1 ? 0 : nil }
@@ -449,8 +426,6 @@ private struct SensorCard: View {
         return "\(h)h \(mm)m"
     }
 }
-
-// MARK: - Zone bar
 
 private struct ZoneBar: View {
     let zone: HRZone
