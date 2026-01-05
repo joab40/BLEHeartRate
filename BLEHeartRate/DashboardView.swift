@@ -1,4 +1,4 @@
-// Version 1.0.16
+// Version 1.0.17
 import SwiftUI
 
 struct DashboardView: View {
@@ -84,15 +84,6 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
 
                 Spacer()
-
-                if ble.isScanning {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Skannar…")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
             }
             .padding(.horizontal)
         }
@@ -205,7 +196,7 @@ struct DashboardView: View {
         let maxCols: Int
         if width >= 900 { maxCols = 4 }
         else if width >= 700 { maxCols = 3 }
-       else { maxCols = 2 }
+        else { maxCols = 2 }
 
         let candidates = Array(2...maxCols)
 
@@ -282,7 +273,6 @@ private struct SensorCard: View {
                 Spacer()
 
                 VStack(alignment: .trailing, spacing: 6) {
-                    // ✅ Zon-badge
                     if let zoneLabel {
                         Text(zoneLabel)
                             .font(.caption.weight(.semibold))
@@ -349,7 +339,6 @@ private struct SensorCard: View {
                     .foregroundStyle(.secondary)
             }
 
-            // ✅ Behåll zonbar om du vill (den är diskret och tydlig)
             if let zone {
                 ZoneBar(zone: zone, isStale: rt.isStale)
             } else {
@@ -364,7 +353,6 @@ private struct SensorCard: View {
                 RoundedRectangle(cornerRadius: 26, style: .continuous)
                     .fill(.ultraThinMaterial)
 
-                // ✅ Endast svag zon-tint (ingen vänsterlinje)
                 if zone != nil {
                     RoundedRectangle(cornerRadius: 26, style: .continuous)
                         .fill(zoneColor.opacity(faded ? 0.05 : 0.10))
