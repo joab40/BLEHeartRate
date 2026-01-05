@@ -1,4 +1,9 @@
-// Version 1.0.20
+// Version 1.0.23
+// NOTE (Scan-strategy):
+// - Dashboard ska inte anropa BLECoordinator.startScan()/stopScan() direkt (de kan vara private eller kräva extra parametrar).
+// - Använd alltid de publika wrappers: userStartScanning() / userStopScanning().
+//   Dessa respekterar scanMode (auto vs manualOff) och håller logiken samlad i BLECoordinator.
+
 import SwiftUI
 
 struct DashboardView: View {
@@ -96,12 +101,13 @@ struct DashboardView: View {
                 Label("Reconnect all", systemImage: "arrow.clockwise")
             }
 
+            // ✅ FIX: Använd publika wrappers (respekterar scanMode + ingen "scope"-param)
             if ble.isScanning {
-                Button { ble.stopScan() } label: {
+                Button { ble.userStopScanning() } label: {
                     Label("Stop", systemImage: "stop.circle")
                 }
             } else {
-                Button { ble.startScan() } label: {
+                Button { ble.userStartScanning() } label: {
                     Label("Scan", systemImage: "magnifyingglass")
                 }
             }
@@ -316,7 +322,7 @@ private struct SensorCard: View {
                 }
             }
 
-            // ✅ Sparkline med "Span" + "Senast" RAD ovanför grafen (inte overlay på grafytan)
+            // Sparkline med "Span" + "Senast" RAD ovanför grafen (inte overlay på grafytan)
             TimelineView(.periodic(from: .now, by: 1.0)) { context in
                 let now = context.date
 

@@ -1,14 +1,16 @@
-// Version 1.0.22
+
+// Version 1.0.23
 // NOTE (Pool/BLE strategy):
 // - Undvik att kalla readRSSI() på varje HR-notification: det kan störa HR-notify-flödet när många sensorer kör samtidigt.
 // - Läs RSSI throttlat (t.ex. max 1 gång/sek per sensor, och extra vid “stale”) för stabilare och snabbare HR-uppdateringar.
 // - Använd en “stale watchdog”: om en sensor är .connected men inte skickat HR på X sek (t.ex. 12s),
 //   forcera reconnect (cancelPeripheralConnection) eftersom “silent links” ofta uppstår när sensorn är under vatten.
-// - Efter hard reset: använd en längre “post-reset holdoff” (t.ex. 4s) så sensorn hinner boota/annonsera stabilt,
-//   annars riskerar man en reconnect-loop om sensorn precis startar om.
-// - Lägg även en “minsta tid mellan connect-försök” (t.ex. 2s per sensor) för att undvika spam vid reboot/instabil radio.
-// - Reconnect backoff kan vara aggressiv tidigt (0–1.5s), men ska alltid respektera holdoff + min-interval.
-// - Vid didDiscover för en “wanted” sensor: trigga reconnect tidigare (via attemptReconnect), men BYPASSA INTE backoff/cooldowns.
+// - Lägg en kort holdoff efter hard reset (t.ex. 0.7s) för att undvika reconnect-loop när sensorn precis doppar/kommer upp.
+// - Reconnect backoff ska vara aggressiv tidigt (0–1.5s) för att fånga upp signal direkt när sensorn kommer upp över ytan.
+// - Vid didDiscover för en “wanted” sensor: om den är disconnected/stale → prioritera reconnect, men respektera holdoff.
+// NOTE (Scanning):
+// - Auto-scan kan vara HR-only (withServices: [180D]) för effektivitet.
+// - Manuell scan i SensorsView bör vara “broad scan” (withServices: nil) för att hitta nya enheter som inte alltid annonserar 180D.
 
 import Foundation
 import Combine
@@ -36,6 +38,15 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     @Published private(set) var scanMode: ScanMode = .auto
 
+    // MARK: - Scan scope (HR-only vs broad)
+
+    private enum ScanScope: Equatable {
+        case hrOnly
+        case broad
+    }
+
+    private var scanScope: ScanScope = .hrOnly
+
     // MARK: - BLE constants
 
     private let hrService = CBUUID(string: "180D")
@@ -60,12 +71,12 @@ final class BLECoordinator: NSObject, ObservableObject {
     private let staleSoftSeconds: Int = 6                     // UI “stale”
     private let staleHardResetSeconds: Int = 12               // hård reset (pool)
 
-    // ✅ Post-hard-reset holdoff (reboot-guard)
-    private let postHardResetHoldoffSeconds: TimeInterval = 4.0
+    // Holdoff efter hard reset (undvik reconnect-loop + ge sensorn tid att boota/annonsera)
+    private let postHardResetHoldoffSeconds: TimeInterval = 0.7
     private var lastHardResetAt: [UUID: Date] = [:]
 
-    // ✅ Minsta tid mellan connect-försök per sensor (anti-spam)
-    private let minConnectAttemptInterval: TimeInterval = 2.0
+    // Anti-spam: begränsa hur ofta vi försöker connecta (även om många events triggar)
+    private let minConnectAttemptInterval: TimeInterval = 0.8
     private var lastConnectAttemptAt: [UUID: Date] = [:]
 
     // MARK: - Internals
@@ -115,28 +126,36 @@ final class BLECoordinator: NSObject, ObservableObject {
 
     // MARK: - Public API (Views)
 
-    /// User pressed Scan in SensorsView (enables auto mode and starts scanning)
+    /// User pressed Scan in SensorsView → enable auto mode and broad scan
     func userStartScanning() {
         scanMode = .auto
-        startScan()
+        startScan(scope: .broad)
     }
 
-    /// User pressed Stop in SensorsView (manual override OFF)
+    /// User pressed Stop in SensorsView → manual override OFF
     func userStopScanning() {
         scanMode = .manualOff
         stopScan()
     }
 
-    /// Auto/Coordinator calls this when it needs to scan (respects manualOff)
+    /// Auto/Coordinator calls this when it needs to scan (respects manualOff) → HR-only
     private func startScanIfAllowed() {
         guard scanMode == .auto else { return }
-        startScan()
+        startScan(scope: .hrOnly)
     }
 
-    func startScan() {
+    private func startScan(scope: ScanScope) {
         guard isPoweredOn else { return }
+
+        // Om vi redan skannar men i "fel scope" → restart scan med nya parametrar
+        if isScanning, scanScope != scope {
+            central.stopScan()
+            isScanning = false
+        }
+
         guard !isScanning else { return }
 
+        scanScope = scope
         isScanning = true
 
         DispatchQueue.main.async { [weak self] in
@@ -146,13 +165,21 @@ final class BLECoordinator: NSObject, ObservableObject {
         let opts: [String: Any] = [
             CBCentralManagerScanOptionAllowDuplicatesKey: true
         ]
-        central.scanForPeripherals(withServices: [hrService], options: opts)
+
+        // ✅ HR-only scan för auto, broad scan för manuell discover
+        switch scope {
+        case .hrOnly:
+            central.scanForPeripherals(withServices: [hrService], options: opts)
+        case .broad:
+            central.scanForPeripherals(withServices: nil, options: opts)
+        }
     }
 
     func stopScan() {
         guard isScanning else { return }
         isScanning = false
         central.stopScan()
+        scanScope = .hrOnly
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -163,9 +190,6 @@ final class BLECoordinator: NSObject, ObservableObject {
     func connect(id: UUID) {
         wantedConnected.insert(id)
         setState(id: id, state: .connecting, text: "Ansluter…")
-
-        // Manual connect: nollställ backoff så vi försöker direkt (men respekterar min-interval + post-reset holdoff)
-        reconnectPolicy[id] = ReconnectPolicy(attemptCount: 0, nextAllowedAt: .distantPast)
 
         if let p = peripherals[id] {
             connectPeripheralIfEligible(p, id: id, now: Date(), reason: "manual connect")
@@ -178,6 +202,7 @@ final class BLECoordinator: NSObject, ObservableObject {
             return
         }
 
+        // No peripheral handle yet -> scan (if allowed)
         startScanIfAllowed()
     }
 
@@ -265,8 +290,8 @@ final class BLECoordinator: NSObject, ObservableObject {
 
             // Hard watchdog: connected men tyst länge → forcera reconnect (pool-case)
             if rt.state == .connected, rt.lastSeenSeconds >= staleHardResetSeconds {
-                // Respektera post-reset holdoff: om vi precis hard-resettat, vänta
-                if isInPostHardResetHoldoff(id: id, now: now) {
+                // Respektera holdoff: om vi precis hard-resettat, vänta
+                if let lastHR = lastHardResetAt[id], now.timeIntervalSince(lastHR) < postHardResetHoldoffSeconds {
                     continue
                 }
 
@@ -285,7 +310,7 @@ final class BLECoordinator: NSObject, ObservableObject {
             }
         }
 
-        // Throttlad RSSI (1Hz)
+        // Throttlad RSSI
         for (id, p) in peripherals where p.state == .connected {
             readRSSIIfAllowed(id: id, peripheral: p, now: now)
         }
@@ -308,7 +333,7 @@ final class BLECoordinator: NSObject, ObservableObject {
         }
 
         if anyAutoNeedsHelp && scanMode == .auto && isPoweredOn && !isScanning {
-            startScan()
+            startScan(scope: .hrOnly)
         }
     }
 
@@ -338,18 +363,9 @@ final class BLECoordinator: NSObject, ObservableObject {
         var pol = reconnectPolicy[id] ?? ReconnectPolicy()
         if now < pol.nextAllowedAt { return }
 
-        guard let p = peripherals[id] else {
-            // Ingen peripheral-handle ännu -> scan (om tillåtet)
-            startScanIfAllowed()
-            return
-        }
-
-        // Om vi inte ens "får" göra ett nytt connect-försök (anti-spam), gör inget nu.
-        if !canAttemptConnectNow(id: id, peripheral: p, now: now) { return }
-
         pol.attemptCount += 1
 
-        // Aggressiv tidigt (pool), men respekteras av nextAllowedAt + min-interval
+        // Aggressiv tidigt (pool)
         let delay: TimeInterval
         switch pol.attemptCount {
         case 1: delay = 0.0
@@ -360,11 +376,15 @@ final class BLECoordinator: NSObject, ObservableObject {
         default: delay = 2.0
         }
 
-        // nextAllowedAt gäller för NÄSTA försök
         pol.nextAllowedAt = now.addingTimeInterval(delay)
         reconnectPolicy[id] = pol
 
-        connectPeripheralIfEligible(p, id: id, now: now, reason: "auto reconnect")
+        if let p = peripherals[id] {
+            if !canAttemptConnectNow(id: id, peripheral: p, now: now) { return }
+            connectPeripheralIfEligible(p, id: id, now: now, reason: "auto reconnect")
+        } else {
+            startScanIfAllowed()
+        }
     }
 
     private func resetReconnectPolicy(id: UUID) {
@@ -536,7 +556,7 @@ final class BLECoordinator: NSObject, ObservableObject {
             let now = Date()
             var rt = self.runtime[id] ?? SensorRuntime()
 
-            // Always update “live” values
+            // Always update live values
             rt.hr = hr
             rt.rrMs = rrMs
             rt.lastHRAt = now
@@ -629,6 +649,12 @@ extension BLECoordinator: CBCentralManagerDelegate {
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any],
                         rssi RSSI: NSNumber) {
+
+        // Broad scan kan hitta "allt" → filtrera bort icke-connectable om flaggan finns
+        if let connectable = advertisementData[CBAdvertisementDataIsConnectable] as? Bool, connectable == false {
+            return
+        }
+
         let id = peripheral.identifier
         peripherals[id] = peripheral
 
@@ -643,6 +669,7 @@ extension BLECoordinator: CBCentralManagerDelegate {
             lastSeen: Date(),
             peripheral: peripheral
         )
+
         discoveredMap[id] = d
         refreshDiscoveredPublished()
 
@@ -654,8 +681,17 @@ extension BLECoordinator: CBCentralManagerDelegate {
 
         let shouldWant = wantedConnected.contains(id) || sensorConfigs.first(where: { $0.id == id })?.autoConnect == true
         if shouldWant {
-            // ✅ Trigga snabbare reconnect vid “dyker upp igen”, men BYPASSA INTE backoff/cooldowns
-            attemptReconnect(id: id, now: Date())
+            let now = Date()
+            let rt = runtime[id] ?? SensorRuntime()
+
+            // Prioritera om den är disconnected eller stale (typ “kom upp ur vatten”)
+            let needsPriority = (rt.state == .disconnected) || rt.isStale || (rt.lastHRAt == nil)
+
+            if needsPriority {
+                connectPeripheralIfEligible(peripheral, id: id, now: now, reason: "discovered priority reconnect")
+            } else {
+                connectPeripheralIfEligible(peripheral, id: id, now: now, reason: "discovered wanted")
+            }
         }
     }
 

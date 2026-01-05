@@ -1,4 +1,14 @@
-// Tag 1.0.3
+// Tag 1.0.23
+// NOTE (Scan strategy / why these wrappers are used):
+// - ContentView (och CoachModeView) anropar INTE BLECoordinator.startScan(...) direkt.
+//   Orsak: startScan kan vara private och/eller kräva extra parametrar (t.ex. scope),
+//   vilket annars ger byggfel när API:t ändras.
+// - I stället används de publika wrapper-metoderna:
+//     • ble.userStartScanning()  -> sätter scanMode = .auto och startar scanning
+//     • ble.userStopScanning()   -> sätter scanMode = .manualOff och stoppar scanning
+//   Detta gör UI:t stabilt över tid, samtidigt som användaren kan slå av/på scanning manuellt.
+// - reconnectAllAuto() finns kvar för att snabbt försöka återansluta sparade sensorer (coach-läge/poolkant).
+
 import SwiftUI
 
 struct ContentView: View {
@@ -202,7 +212,8 @@ private struct CoachModeView: View {
 
                 if ble.isScanning {
                     Button {
-                        ble.stopScan()
+                        // ✅ wrapper (manual OFF) – se note längst upp
+                        ble.userStopScanning()
                     } label: {
                         Label("Stop Scan", systemImage: "stop.circle")
                     }
@@ -210,7 +221,8 @@ private struct CoachModeView: View {
                     .tint(.white.opacity(0.85))
                 } else {
                     Button {
-                        ble.startScan()
+                        // ✅ wrapper (auto ON) – se note längst upp
+                        ble.userStartScanning()
                     } label: {
                         Label("Scan", systemImage: "magnifyingglass")
                     }
